@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 
+const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_PORT = 4096;
 const DEFAULT_HOST = "127.0.0.1";
 const SERVER_START_TIMEOUT = 30_000;
@@ -43,10 +44,12 @@ export async function ensureServer(opts = {}) {
   }
 
   // Start the server
+  // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
   const proc = spawn("opencode", ["serve", "--port", String(port)], {
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
     cwd: opts.cwd,
+    shell: IS_WINDOWS,
   });
   proc.unref();
 
