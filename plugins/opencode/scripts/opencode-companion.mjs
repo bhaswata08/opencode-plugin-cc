@@ -74,7 +74,11 @@ async function handleSetup(argv) {
       try {
         const client = createClient("http://127.0.0.1:4096");
         const providerList = await client.listProviders();
-        if (Array.isArray(providerList)) {
+        if (Array.isArray(providerList?.connected)) {
+          // Current opencode API: GET /provider returns {all, default, connected}.
+          providers = providerList.connected;
+        } else if (Array.isArray(providerList)) {
+          // Older opencode API: GET /provider returned a bare array of providers.
           providers = providerList.map((p) => p.id ?? p.name).filter(Boolean);
         }
       } catch {
