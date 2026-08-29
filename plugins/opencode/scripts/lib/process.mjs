@@ -1,6 +1,7 @@
 // Process utilities for the OpenCode companion.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -80,13 +81,19 @@ export function runCommand(cmd, args, opts = {}) {
  * @returns {import("node:child_process").ChildProcess}
  */
 export function spawnDetached(cmd, args, opts = {}) {
-  const child = spawn(cmd, args, {
-    stdio: "ignore",
-    detached: true,
-    cwd: opts.cwd,
-    env: { ...process.env, ...opts.env },
-    shell: IS_WINDOWS,
-  });
+  const logFd = opts.logFile ? fs.openSync(opts.logFile, "a") : null;
+  let child;
+  try {
+    child = spawn(cmd, args, {
+      stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd],
+      detached: true,
+      cwd: opts.cwd,
+      env: { ...process.env, ...opts.env },
+      shell: IS_WINDOWS,
+    });
+  } finally {
+    if (logFd !== null) fs.closeSync(logFd);
+  }
   child.unref();
   return child;
 }
