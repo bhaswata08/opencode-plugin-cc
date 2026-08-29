@@ -20,7 +20,7 @@ npm i -g opencode-ai   # or: brew install opencode
 # 2. Install the plugin (see Install section below)
 
 # 3. Run the self-test — fixes common footguns for you
-node ~/.claude/plugins/cache/tasict-opencode-plugin-cc/opencode/1.0.0/scripts/opencode-companion.mjs doctor --fix
+node ~/.claude/plugins/cache/tasict-opencode-plugin-cc/opencode/1.1.0/scripts/opencode-companion.mjs doctor --fix
 ```
 
 Then delegate a task from Claude Code:
