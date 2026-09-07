@@ -204,18 +204,25 @@ export const AGY_ALLOWLIST_DOC = [
 // arg building / output parsing (pure, unit-tested)
 // ---------------------------------------------------------------------------
 
+// Seats that must never write. On the opencode backend they are held to that
+// by `tools: {write: false, edit: false, patch: false}` in their agent file;
+// agy has no equivalent, and its only read-only mode is plan. Anything not
+// listed here gets agy's edit-capable default, so a new read-only seat that
+// is not added here would silently gain write access on this backend.
+const READ_ONLY_AGENTS = new Set(["plan", "reviewer", "adversary", "reviewer-fallback", "adversary-fallback"]);
+
 /**
- * Map an opencode agent name to an agy --mode. Only the read-only review
- * agent has a meaningful analogue (plan). Everything else uses agy's
- * edit-capable default. Unknown agents omit the flag (agy default).
+ * Map an opencode agent name to an agy --mode. agy has two modes that matter:
+ * plan (read-only) and accept-edits. Unknown agents omit the flag and take
+ * agy's default.
  * @param {string|undefined} agent
  * @returns {string|undefined}
  */
 export function agentToMode(agent) {
   if (!agent) return undefined;
   const a = String(agent).toLowerCase();
-  if (a === "plan") return "plan";
-  if (a === "build") return "accept-edits";
+  if (READ_ONLY_AGENTS.has(a)) return "plan";
+  if (a === "build" || a === "coder") return "accept-edits";
   return undefined;
 }
 

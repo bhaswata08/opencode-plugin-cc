@@ -24,6 +24,7 @@ import { ensureOpencodeConfig, readOpencodeConfig, missingPermissions, resolveCo
 import { stateRoot } from "./lib/state.mjs";
 import { runCommand } from "./lib/process.mjs";
 import { getCapability, readAgySettings } from "./lib/agy-runner.mjs";
+import { runWithFallback } from "./lib/fallback.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -157,17 +158,36 @@ async function handleReview(argv) {
       report("reviewing", "Running review...");
       log(`Prompt length: ${prompt.length} chars`);
 
-      const response = await client.sendPrompt(session.id, prompt, {
-        agent: "plan", // read-only agent for reviews
+      // The reviewer seat, not agy's bare "plan": this carries the configured
+      // review model, and its agent file is read-only the same way plan is.
+      const { value, handoff } = await runWithFallback({
+        agent: "reviewer",
+        log,
+        attempt: async (sel) => {
+          const response = await client.sendPrompt(session.id, prompt, {
+            agent: sel.agent,
+            model: sel.model,
+          });
+          // Agy backend: learn the real conversation_id (createSession is a
+          // no-op there). No-op for opencode.
+          effectiveSessionId(workspace, job.id, session.id, response);
+          const t = extractResponseText(response);
+          return { text: t, value: { text: t, response } };
+        },
       });
-      // Agy backend: learn the real conversation_id (createSession is a
-      // no-op there). No-op for opencode.
-      effectiveSessionId(workspace, job.id, session.id, response);
+      if (handoff) {
+        upsertJob(workspace, { id: job.id, handoff });
+        throw new Error(
+          `reviewer unreachable (${handoff.reason}). Fallback needs a ` +
+            `${handoff.handoff} on ${handoff.model}; run it from Claude Code.`,
+        );
+      }
+      const response = value.response;
 
       report("finalizing", "Processing review output...");
 
       // Try to parse structured output
-      const text = extractResponseText(response);
+      const text = value.text;
       let structured = tryParseJson(text);
 
       return {
@@ -215,16 +235,30 @@ async function handleAdversarialReview(argv) {
       report("reviewing", "Running adversarial review...");
       log(`Prompt length: ${prompt.length} chars, focus: ${focus || "(none)"}`);
 
-      const response = await client.sendPrompt(session.id, prompt, {
-        agent: "plan",
+      const { value, handoff } = await runWithFallback({
+        agent: "adversary",
+        log,
+        attempt: async (sel) => {
+          const response = await client.sendPrompt(session.id, prompt, {
+            agent: sel.agent,
+            model: sel.model,
+          });
+          // Agy backend: learn the real conversation_id (createSession is a
+          // no-op there). No-op for opencode.
+          effectiveSessionId(workspace, job.id, session.id, response);
+          const t = extractResponseText(response);
+          return { text: t, value: { text: t, response } };
+        },
       });
-      // Agy backend: learn the real conversation_id (createSession is a
-      // no-op there). No-op for opencode.
-      effectiveSessionId(workspace, job.id, session.id, response);
+      if (handoff) {
+        upsertJob(workspace, { id: job.id, handoff });
+        throw new Error(`adversary unreachable (${handoff.reason}).`);
+      }
+      const response = value.response;
 
       report("finalizing", "Processing review output...");
 
-      const text = extractResponseText(response);
+      const text = value.text;
       let structured = tryParseJson(text);
 
       return {
@@ -343,17 +377,35 @@ async function handleTask(argv) {
       report("investigating", "Sending task to OpenCode...");
       log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars`);
 
-      const response = await client.sendPrompt(sessionId, prompt, {
+      const { value, usedFallback, handoff } = await runWithFallback({
         agent: agentName,
         model: options.model,
+        log,
+        attempt: async (sel) => {
+          const response = await client.sendPrompt(sessionId, prompt, {
+            agent: sel.agent,
+            model: sel.model,
+          });
+          // Agy backend: learn the real conversation_id (createSession is a
+          // no-op there). No-op for opencode.
+          sessionId = effectiveSessionId(workspace, job.id, sessionId, response);
+          const t = extractResponseText(response);
+          return { text: t, value: { text: t, response } };
+        },
       });
-      // Agy backend: learn the real conversation_id (createSession is a
-      // no-op there). No-op for opencode.
-      sessionId = effectiveSessionId(workspace, job.id, sessionId, response);
+
+      if (handoff) {
+        upsertJob(workspace, { id: job.id, handoff });
+        throw new Error(
+          `${agentName} unreachable (${handoff.reason}). Fallback needs a ` +
+            `${handoff.handoff} on ${handoff.model}; run it from Claude Code.`,
+        );
+      }
+      if (usedFallback) upsertJob(workspace, { id: job.id, usedFallback: true });
 
       report("finalizing", "Processing task output...");
 
-      const text = extractResponseText(response);
+      const text = value.text;
 
       // Get changed files if write mode
       let changedFiles = [];
@@ -370,7 +422,7 @@ async function handleTask(argv) {
 
       return {
         rendered: text,
-        messages: response,
+        messages: value.response,
         changedFiles,
         summary: text.slice(0, 500),
       };
@@ -419,16 +471,37 @@ async function handleTaskWorker(argv) {
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
       report("investigating", "Running task...");
 
-      const response = await client.sendPrompt(sessionId, prompt, {
+      const { value, usedFallback, handoff } = await runWithFallback({
         agent: agentName,
         model: options.model,
+        log,
+        attempt: async (sel) => {
+          const response = await client.sendPrompt(sessionId, prompt, {
+            agent: sel.agent,
+            model: sel.model,
+          });
+          // Agy backend: learn the real conversation_id (createSession is a
+          // no-op there). No-op for opencode.
+          sessionId = effectiveSessionId(workspace, jobId, sessionId, response);
+          const text = extractResponseText(response);
+          return { text, value: text };
+        },
       });
-      // Agy backend: learn the real conversation_id (createSession is a
-      // no-op there). No-op for opencode.
-      sessionId = effectiveSessionId(workspace, jobId, sessionId, response);
 
-      const text = extractResponseText(response);
-      report("finalizing", "Done");
+      if (handoff) {
+        // The plugin cannot reach this model. Record what the orchestrator
+        // needs to run it instead, and fail loudly rather than returning an
+        // empty result that reads like the agent had nothing to say.
+        upsertJob(workspace, { id: jobId, handoff });
+        throw new Error(
+          `${agentName} unreachable (${handoff.reason}). Fallback needs a ` +
+            `${handoff.handoff} on ${handoff.model}; run it from Claude Code.`,
+        );
+      }
+
+      const text = value;
+      if (usedFallback) upsertJob(workspace, { id: jobId, usedFallback: true });
+      report("finalizing", usedFallback ? "Done (on fallback model)" : "Done");
 
       return { rendered: text, summary: text.slice(0, 500) };
     });
