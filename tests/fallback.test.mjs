@@ -8,6 +8,10 @@ import {
   fallbackBlockedReason,
   runWithFallback,
 } from "../plugins/opencode/scripts/lib/fallback.mjs";
+import {
+  detectQuotaNotice,
+  createClient,
+} from "../plugins/opencode/scripts/lib/opencode-server.mjs";
 
 test("every seat the user configured has a fallback", () => {
   assert.equal(FALLBACKS.coder.backend, "agy");
@@ -39,6 +43,14 @@ test("transport failures are recognised", () => {
     new Error("spawn agy ENOENT"),
     Object.assign(new Error("whatever"), { name: "AbortError" }),
     Object.assign(new Error("opaque"), { code: "ETIMEDOUT" }),
+    new Error("session idle timeout"),
+    new Error("session idle 3601s > 3600s"),
+    new Error("session idle timeout: exceeded max extensions (2) with 1 child process(es) alive"),
+    new Error("prompt timeout"),
+    new Error("Aborted after 14400s (OPENCODE_PROMPT_TIMEOUT_MS=14400000). For longer tasks set OPENCODE_PROMPT_TIMEOUT_MS=3600000 or higher. [prompt timeout]"),
+    new Error("opencode rate limit / quota exceeded: Free usage exceeded, subscribe to Go"),
+    new Error("opencode rate limit / quota exceeded: retrying in 52049s - attempt #1"),
+    new Error("opencode rate limit / quota exceeded: provider rate limit (status 429)"),
   ];
   for (const err of yes) {
     assert.equal(isTransportFailure(err), true, `should be transport: ${err.message}`);
@@ -54,6 +66,9 @@ test("a bad result is not a transport failure", () => {
     new Error("TypeError: parseDuration is not a function"),
     new Error("lint reported 4 errors"),
     new Error("assertion failed: expected 26280000"),
+    new Error("test timed out after 5000ms"),
+    new Error("timeout waiting for condition in test"),
+    new Error("idle connection dropped by test server"),
   ];
   for (const err of no) {
     assert.equal(isTransportFailure(err), false, `should NOT be transport: ${err.message}`);
@@ -177,4 +192,292 @@ test("an empty primary response triggers the fallback", async () => {
   });
   assert.equal(out.usedFallback, true);
   assert.equal(out.value, "real answer");
+});
+
+test("detectQuotaNotice handles structured provider errors and retry notices", () => {
+  assert.equal(detectQuotaNotice(null), null);
+  assert.equal(detectQuotaNotice({}), null);
+
+  // Structured HTTP 429 error on the assistant message
+  const err429 = {
+    info: {
+      role: "assistant",
+      error: {
+        name: "APIError",
+        data: {
+          statusCode: 429,
+          message: "Error from provider (Console): Rate limit exceeded. Please try again later.",
+        },
+      },
+    },
+    parts: [],
+  };
+  assert.match(detectQuotaNotice(err429), /Rate limit exceeded/i);
+
+  // Structured FreeUsageLimitError payload
+  const freeUsage = {
+    info: {
+      role: "assistant",
+      error: {
+        name: "APIError",
+        data: {
+          statusCode: 429,
+          responseBody: JSON.stringify({
+            type: "error",
+            error: {
+              type: "FreeUsageLimitError",
+              message: "Rate limit exceeded.",
+            },
+          }),
+        },
+      },
+    },
+    parts: [],
+  };
+  assert.match(detectQuotaNotice(freeUsage), /FreeUsageLimitError|Rate limit/i);
+
+  // Structured error part in parts array
+  const partErr = {
+    info: { role: "assistant" },
+    parts: [{ type: "error", error: "Rate limit exceeded (429)" }],
+  };
+  assert.match(detectQuotaNotice(partErr), /Rate limit exceeded/i);
+
+  // Exact opencode daemon prose in text part
+  const proseNotice = {
+    info: { role: "assistant" },
+    parts: [
+      {
+        type: "text",
+        text: "Free usage exceeded, subscribe to Go\nretrying in 52049s - attempt #1",
+      },
+    ],
+  };
+  assert.match(detectQuotaNotice(proseNotice), /Free usage exceeded/i);
+
+  const retryNotice = {
+    info: { role: "assistant" },
+    parts: [{ type: "text", text: "retrying in 3600s - attempt #2" }],
+  };
+  assert.match(detectQuotaNotice(retryNotice), /retrying in 3600s/i);
+
+  // Must not false-positive on assistant discussing rate limits in prose
+  const proseAssistant = {
+    info: { role: "assistant" },
+    parts: [
+      {
+        type: "text",
+        text: "I will add a rate limit retry loop to the client and ensure no per-chunk quota exists.",
+      },
+    ],
+  };
+  assert.equal(detectQuotaNotice(proseAssistant), null);
+
+  // Must not false-positive on code edits inside tool inputs
+  const toolPart = {
+    info: { role: "assistant" },
+    parts: [
+      {
+        type: "tool",
+        tool: "edit",
+        state: {
+          status: "completed",
+          input: {
+            content: 'if (err.code === "rate_limit") throw new Error("quota exceeded");',
+          },
+        },
+      },
+    ],
+  };
+  assert.equal(detectQuotaNotice(toolPart), null);
+});
+
+test("sendPrompt watcher aborts promptly on quota notice with a transport failure", async () => {
+  const originalFetch = global.fetch;
+  const originalDelay = process.env.OPENCODE_MIN_POLL_DELAY_MS;
+  const originalInterval = process.env.OPENCODE_COMPLETION_POLL_MS;
+  process.env.OPENCODE_MIN_POLL_DELAY_MS = "10";
+  process.env.OPENCODE_COMPLETION_POLL_MS = "10";
+
+  try {
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/message")) {
+        return new Promise((_, reject) => {
+          if (init?.signal?.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal.reason);
+          });
+        });
+      }
+      if (u.includes("/message?limit=1")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              info: {
+                id: "msg-retry",
+                role: "assistant",
+                time: { created: Date.now() },
+              },
+              parts: [
+                {
+                  type: "text",
+                  text: "Free usage exceeded, subscribe to Go\nretrying in 52049s - attempt #1",
+                },
+              ],
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    const client = createClient("http://127.0.0.1:4096");
+    let caughtErr = null;
+    try {
+      await client.sendPrompt("sess-quota-1", "test prompt");
+    } catch (err) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, "expected sendPrompt to abort and throw");
+    assert.match(caughtErr.message, /quota|rate limit/i);
+    assert.equal(isTransportFailure(caughtErr), true, "quota abort must be classified as a transport failure");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalDelay !== undefined) {
+      process.env.OPENCODE_MIN_POLL_DELAY_MS = originalDelay;
+    } else {
+      delete process.env.OPENCODE_MIN_POLL_DELAY_MS;
+    }
+    if (originalInterval !== undefined) {
+      process.env.OPENCODE_COMPLETION_POLL_MS = originalInterval;
+    } else {
+      delete process.env.OPENCODE_COMPLETION_POLL_MS;
+    }
+  }
+});
+
+test("sendPrompt watcher aborts promptly on structured info.error 429", async () => {
+  const originalFetch = global.fetch;
+  const originalDelay = process.env.OPENCODE_MIN_POLL_DELAY_MS;
+  const originalInterval = process.env.OPENCODE_COMPLETION_POLL_MS;
+  process.env.OPENCODE_MIN_POLL_DELAY_MS = "10";
+  process.env.OPENCODE_COMPLETION_POLL_MS = "10";
+
+  try {
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/message")) {
+        return new Promise((_, reject) => {
+          if (init?.signal?.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal.reason);
+          });
+        });
+      }
+      if (u.includes("/message?limit=1")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              info: {
+                id: "msg-429",
+                role: "assistant",
+                time: { created: Date.now() },
+                error: {
+                  name: "APIError",
+                  data: {
+                    statusCode: 429,
+                    message: "Error from provider (Console): Rate limit exceeded. Please try again later.",
+                  },
+                },
+              },
+              parts: [],
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    const client = createClient("http://127.0.0.1:4096");
+    let caughtErr = null;
+    try {
+      await client.sendPrompt("sess-quota-2", "test prompt");
+    } catch (err) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, "expected sendPrompt to abort on 429");
+    assert.match(caughtErr.message, /quota|rate limit/i);
+    assert.equal(isTransportFailure(caughtErr), true, "429 abort must be classified as a transport failure");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalDelay !== undefined) {
+      process.env.OPENCODE_MIN_POLL_DELAY_MS = originalDelay;
+    } else {
+      delete process.env.OPENCODE_MIN_POLL_DELAY_MS;
+    }
+    if (originalInterval !== undefined) {
+      process.env.OPENCODE_COMPLETION_POLL_MS = originalInterval;
+    } else {
+      delete process.env.OPENCODE_COMPLETION_POLL_MS;
+    }
+  }
+});
+
+test("quota error triggers runWithFallback to retry on agy", async () => {
+  let calls = 0;
+  const out = await runWithFallback({
+    agent: "coder",
+    attempt: async (sel) => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("opencode rate limit / quota exceeded: Free usage exceeded, subscribe to Go");
+      }
+      return { text: "recovered on agy", value: "recovered on agy" };
+    },
+  });
+  assert.equal(out.usedFallback, true);
+  assert.equal(out.value, "recovered on agy");
+});
+
+test("session idle timeout triggers runWithFallback to retry on agy", async () => {
+  let calls = 0;
+  const out = await runWithFallback({
+    agent: "coder",
+    attempt: async (sel) => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("session idle timeout: 3601s > 3600s");
+      }
+      return { text: "recovered after idle timeout", value: "recovered after idle timeout" };
+    },
+  });
+  assert.equal(out.usedFallback, true);
+  assert.equal(out.value, "recovered after idle timeout");
+});
+
+test("prompt timeout triggers runWithFallback to retry on agy", async () => {
+  let calls = 0;
+  const out = await runWithFallback({
+    agent: "coder",
+    attempt: async (sel) => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("Aborted after 14400s (OPENCODE_PROMPT_TIMEOUT_MS=14400000). [prompt timeout]");
+      }
+      return { text: "recovered after prompt timeout", value: "recovered after prompt timeout" };
+    },
+  });
+  assert.equal(out.usedFallback, true);
+  assert.equal(out.value, "recovered after prompt timeout");
 });

@@ -68,6 +68,9 @@ const TRANSPORT_PATTERNS = [
   /overloaded/i,
   /model[^.]{0,40}\b(not found|unavailable|unsupported|does not exist|unknown)\b/i,
   /no such model/i,
+  // timeouts: prompt-level deadline or session stall
+  /prompt timeout/i,
+  /session idle/i,
   // the run produced nothing at all
   /no output produced/i,
   /empty response/i,

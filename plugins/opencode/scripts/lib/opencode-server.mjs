@@ -25,8 +25,12 @@ const PROMPT_TIMEOUT_MS = Number(process.env.OPENCODE_PROMPT_TIMEOUT_MS) || 14_4
 const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // How long a session may go without ANY activity signal before we assume it
 // is stuck. Activity = new message, new parts, tool output growth, status
-// change. Default 1h — long enough for silent-but-live tool subprocesses.
+// change. Default 1h - long enough for silent-but-live tool subprocesses.
 const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 3_600_000;
+// Maximum consecutive idle extensions granted when opencode serve has live
+// child processes. Prevents a stuck or sleeping child from suppressing the
+// idle timeout forever.
+const MAX_IDLE_EXTENSIONS = Number(process.env.OPENCODE_MAX_IDLE_EXTENSIONS) || 2;
 // Bash-tool "no child process" consecutive-miss threshold. If the latest
 // tool is a bash in status=running but opencode serve has zero child
 // processes for N polls in a row, declare stuck. 3 × 5s = 15s grace.
@@ -79,6 +83,69 @@ function countChildren(pid) {
   } catch {
     return -1;
   }
+}
+
+/**
+ * Detect a provider quota or retry notice in a polled session message.
+ *
+ * Checks structured error fields first (info.error, HTTP 429, FreeUsageLimitError).
+ * If structured data is absent, falls back to matching opencode's exact prose
+ * retry wording in text parts.
+ *
+ * Prose matching is fragile: opencode's wording ("Free usage exceeded, subscribe to Go",
+ * "retrying in <N>s - attempt #<M>") can shift across releases or subscription tiers.
+ * Structured fields like info.error are preferred when present.
+ *
+ * @param {object|null|undefined} msg - message object with { info, parts }
+ * @returns {string|null} description of the quota notice, or null if none
+ */
+export function detectQuotaNotice(msg) {
+  if (!msg || typeof msg !== "object") return null;
+
+  const info = msg.info;
+  if (info?.error) {
+    const err = info.error;
+    const statusCode = err.data?.statusCode ?? err.statusCode ?? err.status;
+    const respBody = typeof err.data?.responseBody === "string" ? err.data.responseBody : "";
+    const msgText = String(err.data?.message ?? err.message ?? "");
+
+    if (statusCode === 429) {
+      return msgText || "provider rate limit (status 429)";
+    }
+    if (/FreeUsageLimitError|rate_limit|\bquota\b/i.test(respBody)) {
+      return msgText || respBody;
+    }
+    if (/rate[\s_-]?limit|\bquota\b|Free usage exceeded/i.test(msgText)) {
+      return msgText;
+    }
+  }
+
+  const parts = Array.isArray(msg.parts) ? msg.parts : [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+
+    // Structured error part
+    if (part.type === "error") {
+      const errStr = String(part.error ?? part.message ?? part.text ?? "");
+      if (/rate[\s_-]?limit|\bquota\b|FreeUsageLimitError|429/i.test(errStr)) {
+        return errStr || "error part indicates rate limit / quota";
+      }
+    }
+
+    // Text part: match only opencode's specific daemon notices.
+    // Generic words like "quota" or "rate limit" must not match here because
+    // an assistant discussing or writing rate-limiting code would trigger a false abort.
+    if (part.type === "text" && typeof part.text === "string") {
+      if (/Free usage exceeded/i.test(part.text)) {
+        return part.text.trim();
+      }
+      if (/retrying in \d+s\s*-\s*attempt #\d+/i.test(part.text)) {
+        return part.text.trim();
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -244,7 +311,9 @@ export function createClient(baseUrl, opts = {}) {
       const startedAt = Date.now();
       // Grace period so we don't mistake "session had no prior activity" for
       // completion before the new prompt has even begun generating.
-      const MIN_POLL_DELAY_MS = 5_000;
+      const MIN_POLL_DELAY_MS = process.env.OPENCODE_MIN_POLL_DELAY_MS !== undefined
+        ? Number(process.env.OPENCODE_MIN_POLL_DELAY_MS)
+        : 5_000;
       const POLL_INTERVAL_MS = Number(process.env.OPENCODE_COMPLETION_POLL_MS) || 5_000;
 
       const fetchPromise = (async () => {
@@ -279,6 +348,7 @@ export function createClient(baseUrl, opts = {}) {
         let prevSig = "";
         let lastActivityMs = Date.now();
         let pgrepMissCount = 0;
+        let idleExtensions = 0;
 
         while (!ac.signal.aborted) {
           try {
@@ -313,6 +383,16 @@ export function createClient(baseUrl, opts = {}) {
                 lastActivityMs = Date.now();
                 prevSig = sig;
                 pgrepMissCount = 0;
+                idleExtensions = 0;
+              }
+
+              // Quota detection: abort immediately if opencode entered its
+              // retry backoff loop or reported a quota / rate limit error.
+              const quotaNotice = detectQuotaNotice(last);
+              if (quotaNotice) {
+                const err = new Error(`opencode rate limit / quota exceeded: ${quotaNotice}`);
+                ac.abort(err);
+                throw err;
               }
 
               // Completion signal: assistant message created after our prompt
@@ -359,18 +439,19 @@ export function createClient(baseUrl, opts = {}) {
               const idleMs = Date.now() - lastActivityMs;
               if (idleMs > IDLE_TIMEOUT_MS) {
                 const liveChildren = opencodePid ? countChildren(opencodePid) : 0;
-                if (liveChildren > 0) {
+                if (liveChildren > 0 && idleExtensions < MAX_IDLE_EXTENSIONS) {
+                  idleExtensions += 1;
                   lastActivityMs = Date.now();
                   process.stderr.write(
-                    `opencode watcher: session idle ${Math.floor(idleMs / 1000)}s, but opencode serve (pid ${opencodePid}) has ${liveChildren} child process(es); continuing\n`,
+                    `opencode watcher: session idle ${Math.floor(idleMs / 1000)}s, but opencode serve (pid ${opencodePid}) has ${liveChildren} child process(es); extension ${idleExtensions}/${MAX_IDLE_EXTENSIONS}\n`,
                   );
                 } else {
-                  ac.abort(
-                    new Error(
-                      `session idle ${Math.floor(idleMs / 1000)}s > ${IDLE_TIMEOUT_MS / 1000}s`,
-                    ),
-                  );
-                  throw new Error("session idle timeout");
+                  const reason = liveChildren > 0
+                    ? `session idle timeout: exceeded max extensions (${MAX_IDLE_EXTENSIONS}) with ${liveChildren} child process(es) alive`
+                    : `session idle timeout: ${Math.floor(idleMs / 1000)}s > ${IDLE_TIMEOUT_MS / 1000}s`;
+                  const err = new Error(reason);
+                  ac.abort(err);
+                  throw err;
                 }
               }
             }
@@ -412,9 +493,16 @@ export function createClient(baseUrl, opts = {}) {
         fetchPromise.catch(() => {});
         watcherPromise.catch(() => {});
         if (second.ok) return second.data;
-        // Both failed — surface the more informative error. Prefer the
-        // fetch error because it usually has the HTTP status/body.
-        const rawErr = first.via === "fetch" ? first.err : second.err;
+        // Both failed - surface the more informative error.
+        // If the abort controller was triggered with an explicit reason (quota,
+        // idle timeout, prompt timeout, bash stuck), prefer that over a generic
+        // fetch failure.
+        const rawErr =
+          ac.signal.aborted && ac.signal.reason instanceof Error
+            ? ac.signal.reason
+            : first.via === "fetch"
+              ? first.err
+              : second.err;
         throw classifyError(rawErr, {
           baseUrl,
           startedAt,
@@ -470,3 +558,11 @@ export async function connect(opts = {}) {
   const client = createClient(url, { directory: opts.cwd });
   return { ...client, serverInfo: { url } };
 }
+
+export const __test = {
+  detectQuotaNotice,
+  countChildren,
+  resolveServePid,
+  IDLE_TIMEOUT_MS,
+  MAX_IDLE_EXTENSIONS,
+};
