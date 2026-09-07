@@ -506,6 +506,10 @@ if has_flag "stream-json"; then
     echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"conv-nz-1\\",\\"init\\":{}}"
     echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"conv-nz-1\\",\\"status\\":\\"ERROR\\",\\"response\\":\\"\\",\\"error\\":\\"boom-nz\\"}}"; exit 3
   fi
+  if [[ "$PROMPT" == *"MAKE-RECORDED-PAYLOAD"* ]]; then
+    echo '{"event":"init","conversation_id":"b1b8bb65-394f-47ab-8ba2-9d6953511132","init":{}}'
+    echo '{"event":"result","result":{"conversation_id":"b1b8bb65-394f-47ab-8ba2-9d6953511132","status":"ERROR","response":"### A) ... Result: Success ...\\n### C) ... Result: Error ...","error":"declaring permissions: cortex tool write_to_file: convert tool call for permissions: model output error: invalid tool call error (invalid_args) ./probe_c_delete_me.py must be an absolute path: path is not absolute","duration_seconds":14.45,"num_turns":1}}'; exit 0
+  fi
   if [[ "$PROMPT" == *"MAKE-TOOL"* ]]; then
     echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
     echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"tool\\",\\"tool_name\\":\\"run_command\\",\\"tool_info\\":{\\"name\\":\\"run_command\\",\\"parameters\\":{\\"CommandLine\\":\\"git status\\"}}}}"
@@ -535,6 +539,9 @@ if [[ "$PROMPT" == *"MAKE-NONZERO-JSON"* ]]; then
   # Non-zero exit but a valid JSON body still on stdout - must NOT be
   # treated as "exited with no output"; the status field decides.
   echo '{"conversation_id":"conv-nz-1","status":"ERROR","response":"","error":"boom-nz"}'; exit 3
+fi
+if [[ "$PROMPT" == *"MAKE-RECORDED-PAYLOAD"* ]]; then
+  echo '{"conversation_id":"b1b8bb65-394f-47ab-8ba2-9d6953511132","status":"ERROR","response":"### A) ... Result: Success ...\\n### C) ... Result: Error ...","error":"declaring permissions: cortex tool write_to_file: convert tool call for permissions: model output error: invalid tool call error (invalid_args) ./probe_c_delete_me.py must be an absolute path: path is not absolute","duration_seconds":14.45,"num_turns":1}'; exit 0
 fi
 if [[ "$PROMPT" == *"MAKE-SLEEP"* ]]; then
   if [[ -n "$AGY_FAKE_PIDFILE" ]]; then echo $$ > "$AGY_FAKE_PIDFILE"; fi
@@ -684,6 +691,17 @@ describe("agy client against fake binary", () => {
     assert.match(err.message, /boom-nz/);
     assert.equal(err.conversationId, "conv-nz-1");
     assert.notEqual(err.agyStatus, "EXIT_NONZERO");
+  });
+
+  it("sendPrompt treats status ERROR with non-empty response as completed with warning", async () => {
+    const client = createClient({ directory: "/tmp" });
+    const res = await client.sendPrompt(null, "MAKE-RECORDED-PAYLOAD please", {});
+    assert.equal(res.agy.status, "ERROR");
+    assert.equal(res.agy.conversation_id, "b1b8bb65-394f-47ab-8ba2-9d6953511132");
+    assert.match(res.parts[0].text, /Result: Success/);
+    assert.match(res.parts[0].text, /Result: Error/);
+    assert.match(res.warning, /must be an absolute path: path is not absolute/);
+    assert.equal(res.agy.warning, res.warning);
   });
 
   it("sendPrompt flags CANCELED as a likely permission denial", async () => {

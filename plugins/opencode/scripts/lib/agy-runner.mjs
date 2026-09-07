@@ -879,17 +879,30 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
         throw err;
       }
 
-      if (data.status !== "SUCCESS") {
-        throw toFailure(data, stderr, learnedConversationId);
-      }
-
       const text = typeof data.response === "string" ? data.response : "";
       const cid = data.conversation_id || learnedConversationId;
+      const hasResponse = Boolean(text && text.trim().length > 0);
+
+      // agy sets status ERROR when any single tool call inside the run fails
+      // argument validation (such as a relative path passed to write_to_file),
+      // even when the model observed the error and completed the rest of the
+      // task with a usable response. We treat ERROR with a non-empty response
+      // as a completed run, attaching the error as a warning field so callers
+      // and the job log can show it. Throw only when ERROR comes with an empty response.
+      if (data.status !== "SUCCESS") {
+        if (data.status !== "ERROR" || !hasResponse) {
+          throw toFailure(data, stderr, learnedConversationId);
+        }
+      }
+
+      const warning = data.status === "ERROR" && data.error ? data.error : undefined;
+
       return {
         info: {
           id: cid,
           role: "assistant",
           backend: "agy",
+          ...(warning ? { warning } : {}),
         },
         parts: [{ type: "text", text }],
         agy: {
@@ -899,7 +912,9 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
           num_turns: data.num_turns,
           usage: data.usage,
           denied: false,
+          ...(warning ? { warning } : {}),
         },
+        ...(warning ? { warning } : {}),
       };
     },
 
