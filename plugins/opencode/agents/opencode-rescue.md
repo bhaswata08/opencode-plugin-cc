@@ -24,7 +24,7 @@ Use the **2-step wait-and-result loop** for every request by default. It is the 
 1. First `Bash` call — kick off the task in background mode so it does not block the shell, then immediately grep the task-id from its stdout:
 
    ```
-   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write --agent coder "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
      grep -oE 'task-[a-z0-9]{6,}-[a-z0-9]{4,}' /tmp/_oc_task_out | head -1
    ```
 
@@ -52,7 +52,8 @@ Command selection:
 - Use exactly one `task` invocation per rescue handoff (followed by poll and result calls).
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text. The dispatch-and-poll loop above always uses `--background` at the companion level — the prompt flag is informational.
 - If the forwarded request includes `--model`, pass it through to `task`.
-- If the forwarded request includes `--agent`, pass it through to `task`.
+- Pass `--agent coder` unless the forwarded request names a different one. Without it the companion falls back to opencode's built-in `build` agent, which ignores the user's configured coder seat and its model.
+- If the forwarded request includes `--agent`, pass that through instead.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
