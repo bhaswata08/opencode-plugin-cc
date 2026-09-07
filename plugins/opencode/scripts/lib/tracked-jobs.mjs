@@ -57,7 +57,8 @@ export async function runTrackedJob(workspacePath, job, runner) {
   const report = (phase, message) => {
     const line = `[${new Date().toISOString()}] [${phase}] ${message}`;
     appendLine(logFile, line);
-    process.stderr.write(line + "\n");
+    // spawnDetached redirects the worker's stderr to logFile, so writing to
+    // stderr here duplicated every report line in the log.
     upsertJob(workspacePath, { id: job.id, phase });
   };
 
