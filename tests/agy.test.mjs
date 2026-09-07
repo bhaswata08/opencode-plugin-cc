@@ -268,6 +268,12 @@ describe("agy policy and allow-list docs", () => {
     assert.ok(AGY_TOOL_POLICY.length > 0);
   });
 
+  it("AGY_TOOL_POLICY requires absolute paths for write_to_file", () => {
+    assert.match(AGY_TOOL_POLICY, /always pass an absolute path to write_to_file/);
+    assert.match(AGY_TOOL_POLICY, /relative path is rejected before the write is attempted/);
+    assert.match(AGY_TOOL_POLICY, /rejection wording misleadingly names an artifacts directory/);
+  });
+
   it("passes --dangerously-skip-permissions but never --sandbox", () => {
     const args = buildPrintArgs("do it");
     assert.ok(args.includes("--dangerously-skip-permissions"));

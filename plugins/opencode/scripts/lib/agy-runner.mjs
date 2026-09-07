@@ -148,6 +148,7 @@ export const AGY_TOOL_POLICY = [
   "issue exactly ONE shell command per run_command tool call,",
   "never chain commands with && or ; (chained calls are auto-denied),",
   "prefer the rg shell command over the Grep tool, always with a scoped path or --glob, never repo-wide,",
+  "always pass an absolute path to write_to_file and never a relative one (a relative path is rejected before the write is attempted, and the rejection wording misleadingly names an artifacts directory),",
   "and if a tool call is denied, do not retry the same call: continue with other work",
   "and note the denial briefly in your final summary.",
 ].join(" ");
