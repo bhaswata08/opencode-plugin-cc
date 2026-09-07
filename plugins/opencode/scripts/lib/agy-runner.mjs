@@ -154,6 +154,11 @@ export function workspacePolicy(directory) {
     "the location, so there is no need to look it up first.",
     "File reads and writes need no allow-list rule; only shell commands go",
     "through permissions.allow.",
+    "Every shell command must also run with its working directory set to",
+    `exactly ${directory}. That working directory defaults to the home`,
+    "directory, not to this task's files, so a command left at the default",
+    "runs in the wrong place and reports a failure that looks unrelated",
+    "(a test runner finds no project, a build finds no sources).",
   ].join(" ");
 }
 
@@ -187,8 +192,12 @@ export const AGY_ALLOWLIST_DOC = [
   "  ~/.gemini/antigravity-cli/settings.json  ->  permissions.allow",
   "Add scoped rules (argument-prefix match, no chaining):",
   ...AGY_SCOPED_ALLOWLIST.map((r) => `  "${r}",`),
-  "Do NOT use --dangerously-skip-permissions.",
-  "See AGY_SCOPED_ALLOWLIST in lib/agy-runner.mjs.",
+  "This runner passes --dangerously-skip-permissions, so the allow list is",
+  "inert while that holds and permissions.deny is the only floor. A deny rule",
+  "beats the flag (verified against agy 1.1.19); an allow rule is what the",
+  "flag makes redundant. Keep the allow list current anyway: dropping the flag",
+  "restores it, and it documents what the agent actually needs.",
+  "See AGY_SCOPED_ALLOWLIST and denyListPreflight in lib/agy-runner.mjs.",
 ].join("\n");
 
 // ---------------------------------------------------------------------------
@@ -243,6 +252,17 @@ export function buildPrintArgs(promptText, opts = {}) {
   const mode = opts.mode ?? agentToMode(opts.agent);
   if (mode) args.push("--mode", mode);
   args.push("--output-format", "json");
+  // Headless agy cannot prompt, so without this every command that is not
+  // allow-listed cancels the whole run. The floor is permissions.deny, which
+  // this flag does NOT override (verified against 1.1.19), and
+  // denyListPreflight refuses to launch when that list is empty.
+  //
+  // Deliberately NOT passing --sandbox. The sandbox does not start on every
+  // machine, and when it fails while this flag is set, agy auto-approves the
+  // bypass and runs the command unsandboxed instead of refusing. Without the
+  // flag it correctly fails closed. So --sandbox plus this flag is worse than
+  // either alone, and it must stay out until a startup check can gate it.
+  args.push("--dangerously-skip-permissions");
   args.push("--print-timeout", msToGoDuration(opts.timeoutMs ?? printTimeoutMs()));
   if (opts.conversationId) args.push("--conversation", opts.conversationId);
   if (opts.jsonSchema) args.push("--json-schema", opts.jsonSchema);
@@ -300,18 +320,53 @@ function settingsDir() {
 }
 
 /**
- * Read the agy settings.json permissions.allow list (never throws).
- * @returns {{ path: string, exists: boolean, allow: string[] }}
+ * Read the agy settings.json permission lists (never throws).
+ * @returns {{ path: string, exists: boolean, allow: string[], deny: string[] }}
  */
 export function readAgySettings() {
   const p = path.join(settingsDir(), "settings.json");
+  const strings = (v) => (Array.isArray(v) ? v.filter((r) => typeof r === "string") : []);
   try {
     const data = JSON.parse(fs.readFileSync(p, "utf8"));
-    const allow = data?.permissions?.allow;
-    return { path: p, exists: true, allow: Array.isArray(allow) ? allow.filter((r) => typeof r === "string") : [] };
+    return {
+      path: p,
+      exists: true,
+      allow: strings(data?.permissions?.allow),
+      deny: strings(data?.permissions?.deny),
+    };
   } catch {
-    return { path: p, exists: fs.existsSync(p), allow: [] };
+    return { path: p, exists: fs.existsSync(p), allow: [], deny: [] };
   }
+}
+
+/**
+ * The runner passes --dangerously-skip-permissions, so the deny list is the
+ * only thing left standing between the agent and `sudo`, `git push` or
+ * `rm -rf`. Verified against agy 1.1.19: a deny rule beats that flag, which is
+ * what makes the trade viable at all.
+ *
+ * That inverts the usual failure direction. An empty allow list produced a
+ * loud, harmless denial; an empty DENY list produces a silent, unrestricted
+ * run. So refuse to launch rather than run with no floor. The allow list had
+ * exactly this trap - AGY_SCOPED_ALLOWLIST was documentation nothing
+ * installed - and it cost three failed runs to notice.
+ *
+ * @param {{ exists: boolean, deny: string[], path: string }} settings
+ * @returns {string|null} error message, or null when it is safe to launch
+ */
+export function denyListPreflight(settings) {
+  if (!settings.exists) {
+    return `agy settings not found at ${settings.path}. Refusing to run with --dangerously-skip-permissions and no deny list.`;
+  }
+  if (!settings.deny.length) {
+    return (
+      `agy settings at ${settings.path} declare no permissions.deny rules. ` +
+      "Refusing to run: this runner passes --dangerously-skip-permissions, so " +
+      "an empty deny list means every command is permitted, including sudo, " +
+      "git push and rm -rf."
+    );
+  }
+  return null;
 }
 
 function authTokenPresent() {
@@ -511,6 +566,12 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
      * with raw agy metadata under `.agy`.
      */
     sendPrompt: async (sessionId, promptText, promptOpts = {}) => {
+      // Fail closed before spawning: buildPrintArgs passes
+      // --dangerously-skip-permissions, and permissions.deny is the only floor
+      // left under it.
+      const preflightError = denyListPreflight(readAgySettings());
+      if (preflightError) throw new Error(preflightError);
+
       const fullPrompt = withAgyPolicy(promptText, directory);
       const timeoutMs = Number(promptOpts.timeoutMs) || printTimeoutMs();
       const args = buildPrintArgs(fullPrompt, {

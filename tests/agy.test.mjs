@@ -20,6 +20,7 @@ import {
   parsePrintResult,
   withAgyPolicy,
   workspacePolicy,
+  denyListPreflight,
   AGY_TOOL_POLICY,
   AGY_SCOPED_ALLOWLIST,
   AGY_ALLOWLIST_DOC,
@@ -218,15 +219,56 @@ describe("agy policy and allow-list docs", () => {
     assert.ok(!/\bpwd\b/.test(full));
   });
 
-  it("ships a scoped allow-list and forbids the blanket flag", () => {
+  it("the workspace policy also pins the working directory for shell commands", () => {
+    // Verified against agy 1.1.19: `pwd` run from a prompt that does not name
+    // the workspace returns the HOME directory, not the directory the runner
+    // spawned agy in. Naming it in the prompt fixes it. Without this the file
+    // writes land correctly while `npm test` runs in the wrong repository.
+    const full = withAgyPolicy("Do the thing.", "/work/repo");
+    assert.match(full, /shell command must also run/i);
+    assert.match(full, /working directory/i);
+    // The instruction is useless unless it carries the path.
+    const afterCwdMention = full.slice(full.search(/shell command must also run/i));
+    assert.ok(afterCwdMention.includes("/work/repo"));
+  });
+
+  it("ships a scoped allow-list and documents that deny is the floor", () => {
     assert.ok(AGY_SCOPED_ALLOWLIST.length > 0);
     for (const rule of AGY_SCOPED_ALLOWLIST) {
       assert.ok(rule.startsWith("command("), rule);
     }
     assert.ok(!AGY_SCOPED_ALLOWLIST.includes("--dangerously-skip-permissions"));
-    assert.match(AGY_ALLOWLIST_DOC, /Do NOT use --dangerously-skip-permissions/);
+    assert.match(AGY_ALLOWLIST_DOC, /permissions\.deny is the only floor/);
     assert.ok(AGY_TOOL_POLICY.length > 0);
   });
+
+  it("passes --dangerously-skip-permissions but never --sandbox", () => {
+    const args = buildPrintArgs("do it");
+    assert.ok(args.includes("--dangerously-skip-permissions"));
+    // With the skip flag set, a sandbox that fails to start is auto-approved
+    // as a bypass and the command runs unsandboxed. Without the flag agy
+    // fails closed. Verified against agy 1.1.19, where the sandbox server does
+    // not start at all on this machine. The two must not ship together until
+    // a startup check can gate them.
+    assert.ok(!args.includes("--sandbox"));
+    // --print must stay last: it swallows the next token as its prompt.
+    assert.equal(args[args.length - 2], "--print");
+  });
+
+  it("denyListPreflight refuses to launch without a floor", () => {
+    // No settings at all.
+    assert.match(
+      denyListPreflight({ exists: false, deny: [], path: "/nowhere/settings.json" }) ?? "",
+      /Refusing to run/,
+    );
+    // Settings present but no deny rules: the dangerous case, because the
+    // skip-permissions flag then permits everything.
+    const empty = denyListPreflight({ exists: true, deny: [], path: "/s.json" });
+    assert.match(empty ?? "", /no permissions\.deny rules/);
+    // A real deny list is the only thing that makes launching safe.
+    assert.equal(denyListPreflight({ exists: true, deny: ["command(sudo)"], path: "/s.json" }), null);
+  });
+
 });
 
 describe("backend selection", () => {
@@ -393,6 +435,15 @@ describe("agy client against fake binary", () => {
     fs.writeFileSync(
       path.join(fakeHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
       "fake-token",
+      "utf8",
+    );
+    // sendPrompt refuses to launch without a deny list, since it passes
+    // --dangerously-skip-permissions. Give the fake home a minimal one so the
+    // transport tests exercise the transport rather than the preflight; the
+    // preflight has its own tests below.
+    fs.writeFileSync(
+      path.join(fakeHome, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ permissions: { allow: ["command(ls)"], deny: ["command(sudo)"] } }),
       "utf8",
     );
     fs.mkdirSync(fakeBin, { recursive: true });
@@ -582,16 +633,22 @@ describe("agy client against fake binary", () => {
     assert.deepEqual(paths, ["a.txt", "b.txt"]);
   });
 
-  it("readAgySettings parses the allow list", async () => {
+  it("readAgySettings parses the allow and deny lists", async () => {
     const settingsPath = path.join(fakeHome, ".gemini", "antigravity-cli", "settings.json");
     fs.writeFileSync(
       settingsPath,
-      JSON.stringify({ permissions: { allow: ["command(ls)", "command(cat)"] } }),
+      JSON.stringify({
+        permissions: { allow: ["command(ls)", "command(cat)"], deny: ["command(sudo)", 7] },
+      }),
       "utf8",
     );
     const s = readAgySettings();
     assert.equal(s.exists, true);
     assert.deepEqual(s.allow, ["command(ls)", "command(cat)"]);
+    // Non-string entries are dropped rather than trusted as rules. The deny
+    // list is the floor under --dangerously-skip-permissions, so a malformed
+    // entry must not be counted as one.
+    assert.deepEqual(s.deny, ["command(sudo)"]);
   });
 
   it("__test exposes the resolved print timeout", () => {
@@ -700,6 +757,12 @@ describe("handler-level: agy task persists the learned session id", () => {
     fs.writeFileSync(
       path.join(fakeHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
       "fake-token",
+      "utf8",
+    );
+    // sendPrompt's deny-list preflight refuses to launch without one.
+    fs.writeFileSync(
+      path.join(fakeHome, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ permissions: { allow: ["command(ls)"], deny: ["command(sudo)"] } }),
       "utf8",
     );
 
