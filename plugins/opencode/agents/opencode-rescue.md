@@ -2,6 +2,14 @@
 name: opencode-rescue
 description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to OpenCode through the shared runtime
 tools: Bash
+# This wrapper runs a shell command and hands back its output. Without this key
+# it inherits the orchestrator's model, so a three-way dispatch spent three Opus
+# contexts to type three node invocations. Sonnet rather than Haiku because the
+# job is not as trivial as it reads: it strips routing flags while keeping the
+# rest of the prompt verbatim, runs a 20-round loop branching on exit codes, and
+# must return a large result block untouched. That last one is the failure the
+# vague-result section below exists to prevent.
+model: sonnet
 skills:
   - opencode-runtime
   - opencode-prompting

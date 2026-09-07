@@ -1,6 +1,6 @@
 {
   "name": "opencode",
-  "version": "1.4.0-agy",
+  "version": "1.5.0-agy",
   "description": "Use OpenCode or antigravity from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "OpenCode Community"
