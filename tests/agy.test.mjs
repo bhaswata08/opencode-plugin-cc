@@ -30,6 +30,8 @@ import {
   ensureServer,
   connect,
   readAgySettings,
+  DEFAULT_GEMINIIGNORE,
+  ensureWorkspaceGeminiignore,
   __test,
 } from "../plugins/opencode/scripts/lib/agy-runner.mjs";
 import {
@@ -194,6 +196,15 @@ describe("agy policy and allow-list docs", () => {
     assert.ok(full.includes("&&"));
   });
 
+  it("steers searches toward scoped rg rather than repo-wide Grep", () => {
+    // agy's built-in Grep tool does not filter ignored folders like .venv.
+    // Repo-wide searches hit internal deadlines and fail the whole session.
+    // The policy directs models toward rg with a scoped path or glob instead.
+    const full = withAgyPolicy("Find the bug.");
+    assert.ok(full.includes("prefer the rg shell command over the Grep tool"));
+    assert.ok(full.includes("never repo-wide"));
+  });
+
   it("is idempotent", () => {
     assert.equal(withAgyPolicy(withAgyPolicy("x")), withAgyPolicy("x"));
   });
@@ -269,6 +280,72 @@ describe("agy policy and allow-list docs", () => {
     assert.equal(denyListPreflight({ exists: true, deny: ["command(sudo)"], path: "/s.json" }), null);
   });
 
+});
+
+describe("workspace .geminiignore management", () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = createTmpDir("agy-geminiignore");
+  });
+
+  afterEach(() => {
+    cleanupTmpDir(tmpDir);
+  });
+
+  it("creates .geminiignore with default set when absent", () => {
+    // Heavy directories like .venv cause agy Grep to hit deadline timeouts.
+    // The runner ensures a root .geminiignore exists before executing prompts.
+    const target = path.join(tmpDir, ".geminiignore");
+    assert.equal(fs.existsSync(target), false);
+    const created = ensureWorkspaceGeminiignore(tmpDir);
+    assert.equal(created, true);
+    assert.equal(fs.existsSync(target), true);
+    const content = fs.readFileSync(target, "utf8");
+    assert.equal(content, `${DEFAULT_GEMINIIGNORE.join("\n")}\n`);
+  });
+
+  it("leaves an existing .geminiignore untouched", () => {
+    // User configuration must win over defaults. Modifying or merging user
+    // ignore rules can corrupt custom setups, which is worse than the bug.
+    const target = path.join(tmpDir, ".geminiignore");
+    const userRules = ".custom-env/\nbuild-output/\n";
+    fs.writeFileSync(target, userRules, "utf8");
+    const created = ensureWorkspaceGeminiignore(tmpDir);
+    assert.equal(created, false);
+    assert.equal(fs.readFileSync(target, "utf8"), userRules);
+  });
+
+  it("ships a default set containing .venv/, node_modules/, and .git/", () => {
+    // These heavy trees represent common paths that Grep should avoid walking.
+    assert.ok(DEFAULT_GEMINIIGNORE.includes(".venv/"));
+    assert.ok(DEFAULT_GEMINIIGNORE.includes("node_modules/"));
+    assert.ok(DEFAULT_GEMINIIGNORE.includes(".git/"));
+  });
+
+  it("gracefully handles invalid or missing workspace directory paths", () => {
+    assert.equal(ensureWorkspaceGeminiignore(undefined), false);
+    assert.equal(ensureWorkspaceGeminiignore(""), false);
+    assert.equal(ensureWorkspaceGeminiignore(path.join(tmpDir, "does-not-exist")), false);
+  });
+
+  it("createSession ensures .geminiignore is created when absent", async () => {
+    const target = path.join(tmpDir, ".geminiignore");
+    assert.equal(fs.existsSync(target), false);
+    const client = createClient({ directory: tmpDir });
+    await client.createSession({ title: "Session title" });
+    assert.equal(fs.existsSync(target), true);
+    assert.equal(fs.readFileSync(target, "utf8"), `${DEFAULT_GEMINIIGNORE.join("\n")}\n`);
+  });
+
+  it("createSession leaves existing .geminiignore untouched", async () => {
+    const target = path.join(tmpDir, ".geminiignore");
+    const userRules = "dist/\n";
+    fs.writeFileSync(target, userRules, "utf8");
+    const client = createClient({ directory: tmpDir });
+    await client.createSession({ title: "Session title" });
+    assert.equal(fs.readFileSync(target, "utf8"), userRules);
+  });
 });
 
 describe("backend selection", () => {
@@ -666,6 +743,30 @@ describe("agy client against fake binary", () => {
     if (process.platform !== "win32") {
       assert.equal(__test.needsWindowsShell("agy.cmd"), false);
     }
+  });
+
+  it("sendPrompt ensures .geminiignore exists before sending prompt", async () => {
+    // Resumed sessions skip createSession entirely, so sendPrompt must
+    // guarantee .geminiignore exists before the child process is spawned.
+    const repoDir = path.join(tmpDir, "work-sendprompt-absent");
+    fs.mkdirSync(repoDir, { recursive: true });
+    const target = path.join(repoDir, ".geminiignore");
+    assert.equal(fs.existsSync(target), false);
+    const client = createClient({ directory: repoDir });
+    await client.sendPrompt(null, "run task", {});
+    assert.equal(fs.existsSync(target), true);
+    assert.equal(fs.readFileSync(target, "utf8"), `${DEFAULT_GEMINIIGNORE.join("\n")}\n`);
+  });
+
+  it("sendPrompt leaves existing .geminiignore untouched", async () => {
+    const repoDir = path.join(tmpDir, "work-sendprompt-present");
+    fs.mkdirSync(repoDir, { recursive: true });
+    const target = path.join(repoDir, ".geminiignore");
+    const customContent = "my-vendor/\n";
+    fs.writeFileSync(target, customContent, "utf8");
+    const client = createClient({ directory: repoDir });
+    await client.sendPrompt(null, "run task", {});
+    assert.equal(fs.readFileSync(target, "utf8"), customContent);
   });
 });
 

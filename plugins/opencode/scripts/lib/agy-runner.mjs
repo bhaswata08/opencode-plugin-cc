@@ -123,10 +123,31 @@ function defaultEffort() {
 // instructions keep recency... no: appended LAST gives it the final word on
 // tool mechanics while the explicit "output format unchanged" line keeps
 // review JSON / task text intact for A/B fairness.
+//
+// agy's built-in Grep tool ignores .gitignore and the fileFiltering settings
+// key. On repos whose trees carry heavy directories like .venv (such as a 4.6 GB
+// virtualenv with 18,000+ torch-wheel files), an unscoped Grep scans all of it,
+// hits an internal per-Grep deadline, and fails the whole run with status ERROR
+// ("context deadline exceeded").
+//
+// Verified end to end on 2026-09-07: agy's Grep DOES honor a .geminiignore
+// file at the workspace root. Adding .venv/ dropped the reproduction run from
+// dying at 1m50s to completing in 30s with correct matches. The settings key
+// alone does nothing; the file is the actual mechanism.
+//
+// The runner guarantees a .geminiignore exists at the workspace root before
+// sending a prompt by writing a small default set (.venv/, node_modules/, .git/)
+// if the file is absent. If the file already exists, the runner leaves it
+// untouched because the user's own rules must win. Appending to a user file, or
+// merging, could corrupt user configuration, which is worse than the bug. This
+// means a workspace with an existing but partial .geminiignore that omits heavy
+// directories can still die of the bug. For those repositories, the policy
+// rule below directing the model toward scoped rg is the remaining defense.
 export const AGY_TOOL_POLICY = [
   "Headless-runner tool policy (mechanics only; the requested output format above is unchanged):",
   "issue exactly ONE shell command per run_command tool call,",
   "never chain commands with && or ; (chained calls are auto-denied),",
+  "prefer the rg shell command over the Grep tool, always with a scoped path or --glob, never repo-wide,",
   "and if a tool call is denied, do not retry the same call: continue with other work",
   "and note the denial briefly in your final summary.",
 ].join(" ");
@@ -168,6 +189,41 @@ export function withAgyPolicy(promptText, directory) {
   if (!promptText) return fullPolicy;
   if (promptText.includes(AGY_TOOL_POLICY)) return promptText;
   return `${promptText}\n\n${fullPolicy}`;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace ignore defaults (.geminiignore)
+// ---------------------------------------------------------------------------
+
+// Minimal set of heavy directory trees agy Grep must never scan. agy Grep
+// ignores .gitignore and fileFiltering settings, but honors a .geminiignore
+// file at the workspace root.
+export const DEFAULT_GEMINIIGNORE = [
+  ".venv/",
+  "node_modules/",
+  ".git/",
+];
+
+/**
+ * Ensure a .geminiignore file exists at the workspace root before a prompt is
+ * sent to agy. If the file is absent, writes the default ignore set. If the
+ * file exists, leaves it completely untouched so user rules win.
+ *
+ * @param {string|undefined} directory
+ * @returns {boolean} true if created, false if already present or invalid directory
+ */
+export function ensureWorkspaceGeminiignore(directory) {
+  if (!directory) return false;
+  try {
+    const st = fs.statSync(directory);
+    if (!st.isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  const target = path.join(directory, ".geminiignore");
+  if (fs.existsSync(target)) return false;
+  fs.writeFileSync(target, `${DEFAULT_GEMINIIGNORE.join("\n")}\n`, "utf8");
+  return true;
 }
 
 // Starting point for the user's permissions.allow list in
@@ -559,12 +615,15 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
      * learn the real id from sendPrompt's response (see agy.conversation_id)
      * and backend.mjs effectiveSessionId persists it to the job record.
      */
-    createSession: async (sessOpts = {}) => ({
-      id: null,
-      title: sessOpts.title ?? null,
-      backend: "agy",
-      pending: true,
-    }),
+    createSession: async (sessOpts = {}) => {
+      if (directory) ensureWorkspaceGeminiignore(directory);
+      return {
+        id: null,
+        title: sessOpts.title ?? null,
+        backend: "agy",
+        pending: true,
+      };
+    },
 
     /**
      * Spawn `agy --print` and return the result in the opencode message
@@ -578,6 +637,8 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       // left under it.
       const preflightError = denyListPreflight(readAgySettings());
       if (preflightError) throw new Error(preflightError);
+
+      if (directory) ensureWorkspaceGeminiignore(directory);
 
       const fullPrompt = withAgyPolicy(promptText, directory);
       const timeoutMs = Number(promptOpts.timeoutMs) || printTimeoutMs();
