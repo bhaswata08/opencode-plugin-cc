@@ -314,7 +314,8 @@ export function buildPrintArgs(promptText, opts = {}) {
   if (effort) args.push("--effort", effort);
   const mode = opts.mode ?? agentToMode(opts.agent);
   if (mode) args.push("--mode", mode);
-  args.push("--output-format", "json");
+  const outputFormat = opts.outputFormat ?? "stream-json";
+  args.push("--output-format", outputFormat);
   // Headless agy cannot prompt, so without this every command that is not
   // allow-listed cancels the whole run. The floor is permissions.deny, which
   // this flag does NOT override (verified against 1.1.19), and
@@ -355,23 +356,141 @@ export function parseModelsOutput(stdout) {
 }
 
 /**
- * Parse `agy --output-format json --print` stdout.
+ * Format a tool call parameter summary into a readable string.
+ * @param {string} toolName
+ * @param {object} [params]
+ * @returns {string}
+ */
+export function formatToolDetail(toolName, params) {
+  if (!params || typeof params !== "object") return "";
+  const raw = params.CommandLine
+    || params.TargetFile
+    || params.AbsolutePath
+    || params.DirectoryPath
+    || params.Pattern
+    || params.Query
+    || params.query
+    || params.Url
+    || params.Prompt
+    || params.Action
+    || (typeof Object.values(params)[0] === "string" ? Object.values(params)[0] : "");
+  const detail = String(raw).trim();
+  if (!detail) return "";
+  return detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
+}
+
+/**
+ * Format an NDJSON stream event from agy into a human-readable log line.
+ * Returns null for uninteresting or redundant events (such as intermediate deltas).
+ *
+ * @param {object} evt - parsed NDJSON event object
+ * @param {Set<number>} [seenSteps] - track step indices to avoid duplicate lines
+ * @returns {string|null}
+ */
+export function formatProgressEvent(evt, seenSteps = new Set()) {
+  if (!evt || typeof evt !== "object") return null;
+
+  if (evt.event === "init") {
+    const cid = evt.conversation_id || evt.init?.conversation_id;
+    return cid ? `session started (${cid})` : "session started";
+  }
+
+  if (evt.event === "step_update" && evt.step_update) {
+    const su = evt.step_update;
+    const stepType = su.step_type;
+    const state = su.state;
+    const stepIndex = su.step_index;
+
+    if (stepType === "tool") {
+      const toolName = su.tool_name || su.tool_info?.name || "tool";
+      if (state === "ACTIVE") {
+        const detail = formatToolDetail(toolName, su.tool_info?.parameters);
+        return detail ? `tool: ${toolName} (${detail})` : `tool: ${toolName}`;
+      }
+      if (state === "DONE") {
+        const dur = typeof su.duration_seconds === "number"
+          ? ` (${su.duration_seconds.toFixed(2)}s)`
+          : "";
+        return `tool: ${toolName} completed${dur}`;
+      }
+      if (state === "ERROR") {
+        const errMsg = su.tool_info?.error?.message || "unknown error";
+        return `tool: ${toolName} failed: ${errMsg}`;
+      }
+    }
+
+    if (stepType === "agent_response") {
+      if (state === "ACTIVE") {
+        if (!seenSteps.has(stepIndex)) {
+          seenSteps.add(stepIndex);
+          return "agent responding";
+        }
+      } else if (state === "DONE") {
+        if (!seenSteps.has(stepIndex)) {
+          seenSteps.add(stepIndex);
+          const dur = typeof su.duration_seconds === "number"
+            ? ` (${su.duration_seconds.toFixed(2)}s)`
+            : "";
+          return `agent thinking completed${dur}`;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Parse `agy --output-format stream-json --print` (or legacy json) stdout.
  * @param {string} stdout
  * @returns {{ conversation_id: string, status: string, response: string, error?: string, duration_seconds?: number, num_turns?: number, usage?: object }}
  */
 export function parsePrintResult(stdout) {
   const text = String(stdout ?? "").trim();
   if (!text) throw new Error("agy produced no output (empty stdout)");
-  let data;
+
+  // 1. Try parsing whole text first (single JSON document).
   try {
-    data = JSON.parse(text);
-  } catch {
+    const data = JSON.parse(text);
+    if (data && typeof data === "object") {
+      if (data.event === "result" && data.result && typeof data.result.status === "string") {
+        return data.result;
+      }
+      if (typeof data.status === "string") {
+        return data;
+      }
+      throw new Error(`agy output missing status field: ${text.slice(0, 200)}`);
+    }
+  } catch (err) {
+    if (err.message.includes("missing status field")) throw err;
+  }
+
+  // 2. Parse as NDJSON (stream-json emits one JSON object per line).
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  let foundJson = false;
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let parsed;
+    try {
+      parsed = JSON.parse(lines[i]);
+      foundJson = true;
+    } catch {
+      continue;
+    }
+    if (parsed && typeof parsed === "object") {
+      if (parsed.event === "result" && parsed.result && typeof parsed.result.status === "string") {
+        return parsed.result;
+      }
+      if (typeof parsed.status === "string") {
+        return parsed;
+      }
+    }
+  }
+
+  if (!foundJson) {
     throw new Error(`agy output was not JSON: ${text.slice(0, 200)}`);
   }
-  if (!data || typeof data !== "object" || typeof data.status !== "string") {
-    throw new Error(`agy output missing status field: ${text.slice(0, 200)}`);
-  }
-  return data;
+  throw new Error(`agy output missing status field: ${text.slice(0, 200)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +587,7 @@ function runBinary(args, { timeoutMs = 15_000 } = {}) {
 
 /**
  * Check the agy backend is usable: binary present, version resolvable, auth
- * token exists. Never throws — returns a capability object.
+ * token exists. Never throws - returns a capability object.
  * @returns {Promise<{ ok: boolean, binary: string, version: string|null, authPresent: boolean, problems: string[] }>}
  */
 export async function getCapability() {
@@ -573,15 +692,15 @@ function deniedHint() {
   );
 }
 
-function toFailure(data, stderrText) {
-  const cid = data?.conversation_id || null;
+function toFailure(data, stderrText, learnedCid) {
+  const cid = data?.conversation_id || learnedCid || null;
   const status = data?.status || "UNKNOWN";
   const agyErr = data?.error ? `: ${data.error}` : "";
   const emptyResponse = !data?.response;
   const hint = status === "CANCELED" && emptyResponse
     // CANCELED + empty response is the observed signature of a permission
     // auto-denial (a tool needed approval headless mode cannot prompt for).
-    ? ` Likely a permission denial — ${deniedHint()}`
+    ? ` Likely a permission denial - ${deniedHint()}`
     : "";
   const err = new Error(
     `agy run ${status}${agyErr}${hint}` +
@@ -604,6 +723,7 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
     ? baseUrlOrOpts
     : (maybeOpts ?? {});
   const directory = opts.directory ?? opts.cwd;
+  const defaultOnProgress = opts.onProgress ?? opts.log;
 
   return {
     backend: "agy",
@@ -649,6 +769,7 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
         mode: promptOpts.mode,
         conversationId: sessionId ?? undefined,
         jsonSchema: promptOpts.jsonSchema,
+        outputFormat: promptOpts.outputFormat,
         timeoutMs,
       });
 
@@ -663,7 +784,42 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       const entry = trackProc(sessionId ?? null, proc);
       let stdout = "";
       let stderr = "";
-      proc.stdout.on("data", (d) => (stdout += d));
+      let stdoutBuffer = "";
+      let learnedConversationId = sessionId ?? null;
+      const seenSteps = new Set();
+      const progressCb = promptOpts.onProgress ?? promptOpts.log ?? defaultOnProgress;
+
+      proc.stdout.on("data", (chunk) => {
+        const str = chunk.toString();
+        stdout += str;
+        stdoutBuffer += str;
+
+        const lines = stdoutBuffer.split("\n");
+        stdoutBuffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const evt = JSON.parse(trimmed);
+            if (evt?.conversation_id && !learnedConversationId) {
+              learnedConversationId = evt.conversation_id;
+            } else if (evt?.init?.conversation_id && !learnedConversationId) {
+              learnedConversationId = evt.init.conversation_id;
+            } else if (evt?.result?.conversation_id && !learnedConversationId) {
+              learnedConversationId = evt.result.conversation_id;
+            }
+            if (progressCb) {
+              const msg = formatProgressEvent(evt, seenSteps);
+              if (msg) {
+                try { progressCb(msg, evt); } catch { /* ignore logging failures */ }
+              }
+            }
+          } catch {
+            // Partial or non-JSON line, continue buffering
+          }
+        }
+      });
       proc.stderr.on("data", (d) => (stderr += d));
 
       const exitCode = await new Promise((resolve) => {
@@ -679,6 +835,26 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       });
       untrack(entry);
 
+      // Process any trailing buffered line after process exit
+      if (stdoutBuffer.trim()) {
+        try {
+          const evt = JSON.parse(stdoutBuffer.trim());
+          if (evt?.conversation_id && !learnedConversationId) {
+            learnedConversationId = evt.conversation_id;
+          } else if (evt?.result?.conversation_id && !learnedConversationId) {
+            learnedConversationId = evt.result.conversation_id;
+          }
+          if (progressCb) {
+            const msg = formatProgressEvent(evt, seenSteps);
+            if (msg) {
+              try { progressCb(msg, evt); } catch { /* ignore logging failures */ }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       if (exitCode !== 0 && !stdout.trim()) {
         const err = new Error(
           `agy exited ${exitCode} with no output` +
@@ -688,6 +864,7 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
               : ""),
         );
         err.agyStatus = "EXIT_NONZERO";
+        if (learnedConversationId) err.conversationId = learnedConversationId;
         throw err;
       }
 
@@ -696,23 +873,27 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
         data = parsePrintResult(stdout);
       } catch (err) {
         err.message += stderr.trim() ? ` [stderr: ${tailLines(stderr, 5).slice(0, 500)}]` : "";
+        if (learnedConversationId && !err.conversationId) {
+          err.conversationId = learnedConversationId;
+        }
         throw err;
       }
 
       if (data.status !== "SUCCESS") {
-        throw toFailure(data, stderr);
+        throw toFailure(data, stderr, learnedConversationId);
       }
 
       const text = typeof data.response === "string" ? data.response : "";
+      const cid = data.conversation_id || learnedConversationId;
       return {
         info: {
-          id: data.conversation_id,
+          id: cid,
           role: "assistant",
           backend: "agy",
         },
         parts: [{ type: "text", text }],
         agy: {
-          conversation_id: data.conversation_id,
+          conversation_id: cid,
           status: data.status,
           duration_seconds: data.duration_seconds,
           num_turns: data.num_turns,
@@ -781,7 +962,10 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
  */
 export async function connect(opts = {}) {
   const info = await ensureServer();
-  const client = createClient({ directory: opts.cwd ?? opts.directory });
+  const client = createClient({
+    directory: opts.cwd ?? opts.directory,
+    onProgress: opts.onProgress ?? opts.log,
+  });
   return { ...client, serverInfo: { url: "agy:cli", backend: "agy", capability: info.capability } };
 }
 

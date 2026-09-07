@@ -186,6 +186,21 @@ describe("agy parsePrintResult", () => {
     assert.throws(() => parsePrintResult("not json"), /not JSON/);
     assert.throws(() => parsePrintResult('{"response":"x"}'), /status/);
   });
+
+  it("parses stream-json NDJSON payload extracting the terminal result event", () => {
+    const ndjson = [
+      '{"event":"init","conversation_id":"c-stream-1","init":{"cwd":"/workspace"}}',
+      '{"event":"step_update","step_update":{"conversation_id":"c-stream-1","step_index":0,"state":"DONE","step_type":"user_input"}}',
+      '{"event":"step_update","step_update":{"conversation_id":"c-stream-1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"hello"}}',
+      '{"event":"result","result":{"conversation_id":"c-stream-1","status":"SUCCESS","response":"hello\\n","duration_seconds":2.5,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":20}}}',
+    ].join("\n");
+    const data = parsePrintResult(ndjson);
+    assert.equal(data.conversation_id, "c-stream-1");
+    assert.equal(data.status, "SUCCESS");
+    assert.equal(data.response, "hello\n");
+    assert.equal(data.duration_seconds, 2.5);
+    assert.equal(data.usage?.input_tokens, 100);
+  });
 });
 
 describe("agy policy and allow-list docs", () => {
@@ -475,6 +490,41 @@ for a in "$@"; do
   if [[ "$PREV" == "--print" ]]; then PROMPT="$a"; fi
   PREV="$a"
 done
+CID="\${CONV:-fresh-conv-123}"
+if has_flag "stream-json"; then
+  if [[ "$PROMPT" == *"MAKE-ERROR"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"conv-err-1\\",\\"init\\":{}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"conv-err-1\\",\\"status\\":\\"ERROR\\",\\"response\\":\\"\\",\\"error\\":\\"boom\\"}}"; exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-CANCELED"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"conv-can-1\\",\\"init\\":{}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"conv-can-1\\",\\"status\\":\\"CANCELED\\",\\"response\\":\\"\\"}}"; exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-NONZERO-JSON"* ]]; then
+    # Non-zero exit but a valid JSON body still on stdout - must NOT be
+    # treated as "exited with no output"; the status field decides.
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"conv-nz-1\\",\\"init\\":{}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"conv-nz-1\\",\\"status\\":\\"ERROR\\",\\"response\\":\\"\\",\\"error\\":\\"boom-nz\\"}}"; exit 3
+  fi
+  if [[ "$PROMPT" == *"MAKE-TOOL"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"tool\\",\\"tool_name\\":\\"run_command\\",\\"tool_info\\":{\\"name\\":\\"run_command\\",\\"parameters\\":{\\"CommandLine\\":\\"git status\\"}}}}"
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"DONE\\",\\"step_type\\":\\"tool\\",\\"tool_name\\":\\"run_command\\",\\"duration_seconds\\":0.05,\\"tool_info\\":{\\"name\\":\\"run_command\\",\\"parameters\\":{\\"CommandLine\\":\\"git status\\"},\\"output\\":\\"clean\\"}}}"
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":2,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"FAKE-TOOL-RESPONSE\\"}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"FAKE-TOOL-RESPONSE\\",\\"duration_seconds\\":0.1,\\"num_turns\\":1,\\"usage\\":{}}}"
+    exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-SLEEP"* ]]; then
+    if [[ -n "$AGY_FAKE_PIDFILE" ]]; then echo $$ > "$AGY_FAKE_PIDFILE"; fi
+    # exec so SIGTERM lands directly on sleep (a trapped bash would wait it out).
+    exec sleep 30
+  fi
+  echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+  echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":0,\\"state\\":\\"DONE\\",\\"step_type\\":\\"user_input\\"}}"
+  echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"FAKE-RESPONSE\\"}}"
+  echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"FAKE-RESPONSE\\",\\"duration_seconds\\":0.1,\\"num_turns\\":1,\\"usage\\":{}}}"
+  exit 0
+fi
 if [[ "$PROMPT" == *"MAKE-ERROR"* ]]; then
   echo '{"conversation_id":"conv-err-1","status":"ERROR","response":"","error":"boom"}'; exit 0
 fi
@@ -482,7 +532,7 @@ if [[ "$PROMPT" == *"MAKE-CANCELED"* ]]; then
   echo '{"conversation_id":"conv-can-1","status":"CANCELED","response":""}'; exit 0
 fi
 if [[ "$PROMPT" == *"MAKE-NONZERO-JSON"* ]]; then
-  # Non-zero exit but a valid JSON body still on stdout — must NOT be
+  # Non-zero exit but a valid JSON body still on stdout - must NOT be
   # treated as "exited with no output"; the status field decides.
   echo '{"conversation_id":"conv-nz-1","status":"ERROR","response":"","error":"boom-nz"}'; exit 3
 fi
@@ -491,7 +541,6 @@ if [[ "$PROMPT" == *"MAKE-SLEEP"* ]]; then
   # exec so SIGTERM lands directly on sleep (a trapped bash would wait it out).
   exec sleep 30
 fi
-CID="\${CONV:-fresh-conv-123}"
 echo "{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"FAKE-RESPONSE\\",\\"duration_seconds\\":0.1,\\"num_turns\\":1,\\"usage\\":{}}"
 exit 0
 `;
@@ -584,6 +633,21 @@ describe("agy client against fake binary", () => {
     assert.equal(res.info.role, "assistant");
     assert.equal(res.agy.conversation_id, "fresh-conv-123");
     assert.equal(res.agy.status, "SUCCESS");
+  });
+
+  it("sendPrompt forwards stream-json events to onProgress", async () => {
+    const client = createClient({ directory: "/tmp" });
+    const events = [];
+    const res = await client.sendPrompt(null, "MAKE-TOOL please", {
+      onProgress: (line) => events.push(line),
+    });
+    assert.equal(res.agy.status, "SUCCESS");
+    assert.equal(res.parts[0].text, "FAKE-TOOL-RESPONSE");
+    assert.ok(events.length >= 3);
+    assert.ok(events.some((e) => e.includes("session started")));
+    assert.ok(events.some((e) => e.includes("tool: run_command (git status)")));
+    assert.ok(events.some((e) => e.includes("tool: run_command completed (0.05s)")));
+    assert.ok(events.some((e) => e.includes("agent responding")));
   });
 
   it("sendPrompt resumes via --conversation when a session id is given", async () => {

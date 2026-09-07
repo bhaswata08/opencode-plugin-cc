@@ -167,6 +167,7 @@ async function handleReview(argv) {
           const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
+            onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
@@ -242,6 +243,7 @@ async function handleAdversarialReview(argv) {
           const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
+            onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
@@ -385,6 +387,7 @@ async function handleTask(argv) {
           const response = await client.sendPrompt(sessionId, prompt, {
             agent: sel.agent,
             model: sel.model,
+            onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
@@ -479,6 +482,7 @@ async function handleTaskWorker(argv) {
           const response = await client.sendPrompt(sessionId, prompt, {
             agent: sel.agent,
             model: sel.model,
+            onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
