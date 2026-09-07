@@ -139,6 +139,10 @@ The companion now reconciles this automatically:
 - `companion.mjs heal` scans for stuck jobs and reconciles them in bulk. Pass
   `--dry-run` to preview, `--json` for machine-readable output, and `--all`
   to include jobs from other Claude sessions.
+- `companion.mjs clear` removes terminal jobs (completed, failed, cancelled) from
+  state.json and deletes their log and data files. Pass `--keep <n>` to retain
+  the n most recent terminal jobs, `--dry-run` to preview, or `--json` for
+  structured output.
 
 Each heal check queries `GET /session/:id/message?limit=1`. If the last
 assistant message has `info.finish` set and `info.time.completed >= job.startedAt`,

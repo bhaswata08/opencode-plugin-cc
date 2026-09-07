@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { renderStatus, renderResult, renderReview, renderSetup } from "../plugins/opencode/scripts/lib/render.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "../plugins/opencode/scripts/lib/render.mjs";
 
 describe("renderStatus", () => {
   it("renders empty state", () => {
@@ -80,3 +80,25 @@ describe("renderResult", () => {
     assert.ok(output.includes("Connection timeout"));
   });
 });
+
+describe("renderClear", () => {
+  it("renders empty state", () => {
+    const output = renderClear({ cleared: [], kept: 0, dryRun: false });
+    assert.equal(output, "No terminal jobs to clear.");
+  });
+
+  it("renders cleared jobs summary", () => {
+    const output = renderClear({ cleared: ["task-1", "task-2"], kept: 1, dryRun: false });
+    assert.ok(output.includes("## Clear Jobs\n"));
+    assert.ok(output.includes("- **Cleared**: 2"));
+    assert.ok(output.includes("- **Kept**: 1"));
+    assert.ok(output.includes("- task-1"));
+    assert.ok(output.includes("- task-2"));
+  });
+
+  it("renders dry-run header", () => {
+    const output = renderClear({ cleared: ["task-1"], kept: 0, dryRun: true });
+    assert.ok(output.includes("## Clear Jobs (dry-run)\n"));
+  });
+});
+

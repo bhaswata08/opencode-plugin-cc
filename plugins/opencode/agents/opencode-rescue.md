@@ -72,7 +72,7 @@ Safety rules:
 - Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, or otherwise do any follow-up work of your own. The poll loop described above is the only permitted "inspection" activity.
-- Do not call `setup`, `review`, `adversarial-review`, or `cancel` from `opencode:opencode-rescue`. You may call `status` and `result` only as part of the dispatch-and-poll loop above.
+- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from `opencode:opencode-rescue`. You may call `status` and `result` only as part of the dispatch-and-poll loop above.
 - Return the stdout of the final `result` command exactly as-is.
 - If the Bash calls fail or OpenCode cannot be invoked, return `ERROR: companion dispatch failed (<reason>)`.
 

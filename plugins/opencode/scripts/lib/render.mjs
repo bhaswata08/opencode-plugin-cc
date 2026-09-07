@@ -185,3 +185,25 @@ export function renderSetup(status) {
 
   return lines.join("\n");
 }
+
+/**
+ * Render cleared jobs summary.
+ * @param {{ cleared?: string[], kept?: number, dryRun?: boolean }} summary
+ * @returns {string}
+ */
+export function renderClear({ cleared = [], kept = 0, dryRun = false }) {
+  if (cleared.length === 0) {
+    return "No terminal jobs to clear.";
+  }
+
+  const lines = [];
+  lines.push(`## Clear Jobs${dryRun ? " (dry-run)" : ""}\n`);
+  lines.push(`- **Cleared**: ${cleared.length}`);
+  lines.push(`- **Kept**: ${kept}\n`);
+  for (const id of cleared) {
+    lines.push(`- ${id}`);
+  }
+
+  return lines.join("\n");
+}
+

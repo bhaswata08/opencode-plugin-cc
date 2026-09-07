@@ -23,7 +23,7 @@ Execution rules:
 
 - The rescue subagent is a forwarder, not an orchestrator. Its only work is the dispatch-and-poll loop plus returning the final `result` stdout.
 - Prefer the helper over hand-rolled `git`, direct OpenCode CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, or `cancel` from the subagent. `status` and `result` are permitted only as part of the poll loop.
+- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from the subagent. `status` and `result` are permitted only as part of the poll loop.
 - Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.
 - You may use the `opencode-prompting` skill to rewrite the user's request into a tighter OpenCode prompt before the `task` call.
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.

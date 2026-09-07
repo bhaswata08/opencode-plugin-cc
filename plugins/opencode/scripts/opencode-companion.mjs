@@ -15,7 +15,7 @@ import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
-import { renderStatus, renderResult, renderReview, renderSetup } from "./lib/render.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { getDiff, getStatus as getGitStatus } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
@@ -45,6 +45,7 @@ const handlers = {
   result: handleResult,
   "wait-and-result": handleWaitAndResult,
   cancel: handleCancel,
+  clear: handleClear,
   heal: handleHeal,
   doctor: handleDoctor,
   config: handleConfig,
@@ -823,6 +824,95 @@ async function handleCancel(argv) {
   });
 
   console.log(`Canceled job: ${job.id}`);
+}
+
+// ------------------------------------------------------------------
+// Clear
+// ------------------------------------------------------------------
+
+async function handleClear(argv) {
+  const { options } = parseArgs(argv ?? [], {
+    valueOptions: ["keep"],
+    booleanOptions: ["json", "dry-run"],
+  });
+
+  let keepCount = 0;
+  if (options.keep !== undefined) {
+    if (options.keep === true || options.keep === "") {
+      console.error("--keep requires a numeric argument.");
+      process.exit(1);
+    }
+    keepCount = parseInt(options.keep, 10);
+    if (isNaN(keepCount) || keepCount < 0) {
+      console.error("--keep must be a non-negative integer.");
+      process.exit(1);
+    }
+  }
+
+  const dryRun = Boolean(options["dry-run"]);
+  const wantJson = Boolean(options.json);
+
+  const workspace = await resolveWorkspace();
+  const state = loadState(workspace);
+  const jobs = state.jobs ?? [];
+
+  // In-flight work (starting, investigating, running, finalizing, queued) must
+  // never be pruned. Only terminal jobs can be safely purged.
+  const isTerminal = (status) =>
+    status === "completed" || status === "failed" || status === "cancelled";
+
+  const terminalJobs = jobs.filter((j) => isTerminal(j.status));
+
+  // Sorting terminal jobs by most recently updated allows the newest records
+  // to be preserved when a keep limit is requested.
+  const sortedTerminal = [...terminalJobs].sort(
+    (a, b) =>
+      new Date(b.updatedAt || b.createdAt || 0).getTime() -
+      new Date(a.updatedAt || a.createdAt || 0).getTime()
+  );
+
+  const keptJobs = sortedTerminal.slice(0, keepCount);
+  const toClear = sortedTerminal.slice(keepCount);
+  const clearedIds = toClear.map((j) => j.id);
+  const kept = keptJobs.length;
+
+  if (!dryRun && toClear.length > 0) {
+    const toClearSet = new Set(clearedIds);
+    updateState(workspace, (s) => {
+      s.jobs = (s.jobs ?? []).filter((j) => !toClearSet.has(j.id));
+    });
+
+    // Associated log and data files are deleted to free disk space.
+    // Missing files are ignored because jobs may fail before logs are flushed.
+    for (const id of clearedIds) {
+      const logFile = jobLogPath(workspace, id);
+      const dataFile = jobDataPath(workspace, id);
+      try {
+        fs.rmSync(logFile, { force: true });
+      } catch {
+        // Missing file is not an error
+      }
+      try {
+        fs.rmSync(dataFile, { force: true });
+      } catch {
+        // Missing file is not an error
+      }
+    }
+  }
+
+  if (wantJson) {
+    console.log(
+      JSON.stringify({
+        workspaceRoot: workspace,
+        cleared: clearedIds,
+        kept,
+        dryRun,
+      })
+    );
+    return;
+  }
+
+  console.log(renderClear({ cleared: clearedIds, kept, dryRun }));
 }
 
 // ------------------------------------------------------------------
