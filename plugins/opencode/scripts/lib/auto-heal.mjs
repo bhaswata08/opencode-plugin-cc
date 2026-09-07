@@ -224,6 +224,14 @@ export async function autoHealJob(workspace, job, opts = {}) {
     return { job, action: "skip", reason: `status=${job.status} not healable` };
   }
 
+  // Agy backend: there is no server session to probe (agy is CLI print mode
+  // only), so reconcile from worker liveness alone. A live worker means the
+  // --print child may still be running; a dead worker with no terminal state
+  // means the result is unrecoverable.
+  if ((job.backend ?? "opencode") === "agy") {
+    return autoHealAgyJob(workspace, job, opts);
+  }
+
   const startedAtMs =
     toEpochMs(job.startedAt) ||
     toEpochMs(job.createdAt) ||
@@ -330,6 +338,49 @@ export async function autoHealJob(workspace, job, opts = {}) {
     errorMessage: errMsg,
     healed: true,
   });
+  return {
+    job: { ...job, status: "failed", errorMessage: errMsg, healed: true },
+    action: "healed-failed",
+    details: { errorMessage: errMsg },
+  };
+}
+
+/**
+ * Agy-backend reconcile: no server probe possible. A live worker may still
+ * be producing output (skip); a dead worker means the --print result will
+ * never arrive (fail, unless recently updated). Honors dryRun like the
+ * opencode path. Never throws.
+ *
+ * @param {string} workspace
+ * @param {object} job
+ * @param {object} [opts]
+ */
+export async function autoHealAgyJob(workspace, job, opts = {}) {
+  const dryRun = !!opts.dryRun;
+  if (isProcessAlive(job.pid)) {
+    return { job, action: "skip", reason: "worker still alive" };
+  }
+  const updatedMs = toEpochMs(job.updatedAt);
+  const idleMs = updatedMs ? Date.now() - updatedMs : Infinity;
+  if (idleMs < STALE_IDLE_MS) {
+    return { job, action: "skip", reason: `idle ${Math.floor(idleMs / 1000)}s < ${STALE_IDLE_MS / 1000}s threshold` };
+  }
+  const errMsg = "task-worker exited without result (agy backend: no server session to reconcile)";
+  if (dryRun) {
+    return { job, action: "would-fail", details: { errorMessage: errMsg } };
+  }
+  try {
+    upsertJob(workspace, {
+      id: job.id,
+      status: "failed",
+      completedAt: new Date().toISOString(),
+      errorMessage: errMsg,
+      healed: true,
+    });
+  } catch (err) {
+    process.stderr.write(`auto-heal: ${job.id} state write failed: ${err.message}\n`);
+    return { job, action: "skip", reason: `state write failed: ${err.message}` };
+  }
   return {
     job: { ...job, status: "failed", errorMessage: errMsg, healed: true },
     action: "healed-failed",

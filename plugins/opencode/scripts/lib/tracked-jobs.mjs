@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, appendLine } from "./fs.mjs";
 import { generateJobId, upsertJob, jobLogPath, jobDataPath } from "./state.mjs";
+import { resolveBackendName } from "./backend.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
 
@@ -30,6 +31,9 @@ export function createJobRecord(workspacePath, type, meta = {}) {
     type,
     status: "pending",
     sessionId,
+    // Transport that created this job (OPENCODE_BACKEND at creation time),
+    // so cancel/heal stay correct even if the env switches mid-A/B test.
+    backend: resolveBackendName(),
     ...meta,
   };
   upsertJob(workspacePath, job);
@@ -81,12 +85,19 @@ export async function runTrackedJob(workspacePath, job, runner) {
     report("completed", `Job ${job.id} completed`);
     return result;
   } catch (err) {
-    upsertJob(workspacePath, {
+    // F8/F9: a failed or timed-out agy run still learns a conversation_id
+    // (agy-runner attaches it to the thrown error as err.conversationId),
+    // which is the only way to resume that conversation later. Previously
+    // this was persisted only on success, so a failure left nothing
+    // resumable - the id survived only inside the error message text.
+    const failedFields = {
       id: job.id,
       status: "failed",
       completedAt: new Date().toISOString(),
       errorMessage: err.message,
-    });
+    };
+    if (err.conversationId) failedFields.opencodeSessionId = err.conversationId;
+    upsertJob(workspacePath, failedFields);
     report("failed", `Job ${job.id} failed: ${err.message}`);
     throw err;
   }

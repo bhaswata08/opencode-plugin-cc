@@ -162,6 +162,11 @@ export function renderSetup(status) {
   const lines = [];
   lines.push("## OpenCode Setup Status\n");
 
+  // Only shown when a non-default backend is selected, so opencode output
+  // stays byte-for-byte identical for existing users.
+  if (status.backend && status.backend !== "opencode") {
+    lines.push(`- **Backend**: ${status.backend}`);
+  }
   lines.push(`- **Installed**: ${status.installed ? "Yes" : "No"}`);
   if (status.version) {
     lines.push(`- **Version**: ${status.version}`);

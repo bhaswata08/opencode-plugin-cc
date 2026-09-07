@@ -9,7 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
-import { isServerRunning, connect } from "./lib/opencode-server.mjs";
+import { isServerRunning, connect, resolveBackendName } from "./lib/backend.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -26,7 +26,11 @@ async function main() {
 
   // Check if server is available
   if (!(await isServerRunning())) {
-    console.log("ALLOW: OpenCode server not running.");
+    if (resolveBackendName() === "agy") {
+      console.log("ALLOW: agy CLI not available.");
+    } else {
+      console.log("ALLOW: OpenCode server not running.");
+    }
     return;
   }
 

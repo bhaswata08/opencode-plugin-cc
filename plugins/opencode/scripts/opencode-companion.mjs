@@ -9,8 +9,8 @@ import process from "node:process";
 import fs from "node:fs";
 
 import { parseArgs, extractTaskText } from "./lib/args.mjs";
-import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
-import { isServerRunning, ensureServer, createClient, connect } from "./lib/opencode-server.mjs";
+import { spawnDetached } from "./lib/process.mjs";
+import { isServerRunning, ensureServer, createClient, connect, resolveBackendName, effectiveSessionId, isBackendInstalled, getBackendVersion } from "./lib/backend.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
@@ -23,6 +23,7 @@ import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-he
 import { ensureOpencodeConfig, readOpencodeConfig, missingPermissions, resolveConfigPath } from "./lib/opencode-config.mjs";
 import { stateRoot } from "./lib/state.mjs";
 import { runCommand } from "./lib/process.mjs";
+import { getCapability, readAgySettings } from "./lib/agy-runner.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -69,8 +70,9 @@ async function handleSetup(argv) {
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"],
   });
 
-  const installed = await isOpencodeInstalled();
-  const version = installed ? await getOpencodeVersion() : null;
+  const installed = await isBackendInstalled();
+  const version = installed ? await getBackendVersion() : null;
+  const backend = resolveBackendName();
 
   let serverRunning = false;
   let providers = [];
@@ -116,7 +118,7 @@ async function handleSetup(argv) {
     reviewGate = state.config?.reviewGate ?? false;
   }
 
-  const status = { installed, version, serverRunning, providers, reviewGate };
+  const status = { backend, installed, version, serverRunning, providers, reviewGate };
 
   if (options.json) {
     console.log(JSON.stringify(status, null, 2));
@@ -158,6 +160,9 @@ async function handleReview(argv) {
       const response = await client.sendPrompt(session.id, prompt, {
         agent: "plan", // read-only agent for reviews
       });
+      // Agy backend: learn the real conversation_id (createSession is a
+      // no-op there). No-op for opencode.
+      effectiveSessionId(workspace, job.id, session.id, response);
 
       report("finalizing", "Processing review output...");
 
@@ -213,6 +218,9 @@ async function handleAdversarialReview(argv) {
       const response = await client.sendPrompt(session.id, prompt, {
         agent: "plan",
       });
+      // Agy backend: learn the real conversation_id (createSession is a
+      // no-op there). No-op for opencode.
+      effectiveSessionId(workspace, job.id, session.id, response);
 
       report("finalizing", "Processing review output...");
 
@@ -337,7 +345,11 @@ async function handleTask(argv) {
 
       const response = await client.sendPrompt(sessionId, prompt, {
         agent: agentName,
+        model: options.model,
       });
+      // Agy backend: learn the real conversation_id (createSession is a
+      // no-op there). No-op for opencode.
+      sessionId = effectiveSessionId(workspace, job.id, sessionId, response);
 
       report("finalizing", "Processing task output...");
 
@@ -409,7 +421,11 @@ async function handleTaskWorker(argv) {
 
       const response = await client.sendPrompt(sessionId, prompt, {
         agent: agentName,
+        model: options.model,
       });
+      // Agy backend: learn the real conversation_id (createSession is a
+      // no-op there). No-op for opencode.
+      sessionId = effectiveSessionId(workspace, jobId, sessionId, response);
 
       const text = extractResponseText(response);
       report("finalizing", "Done");
@@ -523,6 +539,9 @@ async function handleStatus(argv) {
     const baseUrl = "http://127.0.0.1:4096";
     await Promise.all(snapshot.running.map(async (job) => {
       if (!job.opencodeSessionId) return;
+      // Agy backend: no server session to probe for live activity; the job
+      // phase from state.json is the breadcrumb.
+      if ((job.backend ?? "opencode") === "agy") return;
       const act = await getSessionLastActivity(baseUrl, job.opencodeSessionId);
       if (!act) return;
       const age = act.ageSec != null ? `${act.ageSec}s ago` : "";
@@ -705,6 +724,18 @@ async function handleCancel(argv) {
     } catch {
       // Process may already be gone
     }
+    // Agy backend: the worker's child is the `agy --print` process itself
+    // (no server-side session to abort). The worker was spawned detached so
+    // it leads its own process group — signal the group so the agy child
+    // dies with it instead of running orphaned. Guarded to agy jobs only so
+    // opencode cancel behaviour is unchanged.
+    if ((job.backend ?? "opencode") === "agy") {
+      try {
+        process.kill(-job.pid, "SIGTERM");
+      } catch {
+        // Not a group leader (e.g. foreground job) or already gone
+      }
+    }
   }
 
   upsertJob(workspace, {
@@ -817,56 +848,13 @@ async function handleDoctor(argv) {
   const checks = [];
   const push = (name, status, detail, hint) => checks.push({ name, status, detail, hint });
 
-  // 1. opencode binary in PATH
-  const which = await runCommand("which", ["opencode"]).catch(() => ({ exitCode: 1, stdout: "" }));
-  if (which.exitCode === 0 && which.stdout.trim()) {
-    push("opencode-binary", "PASS", which.stdout.trim(), null);
-  } else {
-    push("opencode-binary", "FAIL", "not in PATH",
-      "Install: npm i -g opencode-ai  OR  brew install opencode");
-  }
+  const backend = resolveBackendName();
+  push("backend", "PASS", `active transport: ${backend} (OPENCODE_BACKEND=${process.env.OPENCODE_BACKEND ?? "(unset, default opencode)"})`, null);
 
-  // 2. opencode version
-  const ver = await runCommand("opencode", ["--version"]).catch(() => ({ exitCode: 1, stdout: "" }));
-  if (ver.exitCode === 0) {
-    push("opencode-version", "PASS", ver.stdout.trim() || "(unknown)", null);
+  if (backend === "agy") {
+    await doctorAgyChecks(push);
   } else {
-    push("opencode-version", "WARN", "could not resolve version", null);
-  }
-
-  // 3. opencode.json permissions (HEADLESS-SAFE — biggest footgun)
-  const cfg = readOpencodeConfig();
-  const missing = missingPermissions(cfg.data);
-  if (cfg.exists && missing.length === 0) {
-    push("opencode-config", "PASS", `${cfg.path} (all permissions allow)`, null);
-  } else {
-    const detail = cfg.exists
-      ? `${cfg.path} — missing: ${missing.join(", ")}`
-      : `${cfg.path} — file missing`;
-    if (fix) {
-      const r = ensureOpencodeConfig({ silent: true });
-      push("opencode-config", r.changed ? "PASS" : "WARN",
-        r.changed ? `fixed: ${r.path}` : detail, null);
-    } else {
-      push("opencode-config", "FAIL", detail,
-        "Run with --fix (or set: permission.{bash,edit,webfetch,external_directory} = \"allow\")");
-    }
-  }
-
-  // 4. server reachable
-  const serverUrl = "http://127.0.0.1:4096";
-  let reachable = false;
-  try {
-    const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
-    reachable = r.ok;
-  } catch {
-    reachable = false;
-  }
-  if (reachable) {
-    push("opencode-server", "PASS", `${serverUrl} reachable`, null);
-  } else {
-    push("opencode-server", "WARN", `${serverUrl} not reachable`,
-      "Start it: opencode serve --port 4096 &");
+    await doctorOpencodeChecks(push, { fix });
   }
 
   // 5. CLAUDE_PLUGIN_DATA sanity check
@@ -947,6 +935,96 @@ async function handleDoctor(argv) {
   if (nFail > 0 && !fix) process.exit(1);
 }
 
+// Moved verbatim from handleDoctor so the opencode self-test path stays
+// identical now that doctor branches per backend.
+async function doctorOpencodeChecks(push, { fix }) {
+  // 1. opencode binary in PATH
+  const which = await runCommand("which", ["opencode"]).catch(() => ({ exitCode: 1, stdout: "" }));
+  if (which.exitCode === 0 && which.stdout.trim()) {
+    push("opencode-binary", "PASS", which.stdout.trim(), null);
+  } else {
+    push("opencode-binary", "FAIL", "not in PATH",
+      "Install: npm i -g opencode-ai  OR  brew install opencode");
+  }
+
+  // 2. opencode version
+  const ver = await runCommand("opencode", ["--version"]).catch(() => ({ exitCode: 1, stdout: "" }));
+  if (ver.exitCode === 0) {
+    push("opencode-version", "PASS", ver.stdout.trim() || "(unknown)", null);
+  } else {
+    push("opencode-version", "WARN", "could not resolve version", null);
+  }
+
+  // 3. opencode.json permissions (HEADLESS-SAFE — biggest footgun)
+  const cfg = readOpencodeConfig();
+  const missing = missingPermissions(cfg.data);
+  if (cfg.exists && missing.length === 0) {
+    push("opencode-config", "PASS", `${cfg.path} (all permissions allow)`, null);
+  } else {
+    const detail = cfg.exists
+      ? `${cfg.path} — missing: ${missing.join(", ")}`
+      : `${cfg.path} — file missing`;
+    if (fix) {
+      const r = ensureOpencodeConfig({ silent: true });
+      push("opencode-config", r.changed ? "PASS" : "WARN",
+        r.changed ? `fixed: ${r.path}` : detail, null);
+    } else {
+      push("opencode-config", "FAIL", detail,
+        "Run with --fix (or set: permission.{bash,edit,webfetch,external_directory} = \"allow\")");
+    }
+  }
+
+  // 4. server reachable
+  const serverUrl = "http://127.0.0.1:4096";
+  let reachable = false;
+  try {
+    const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
+    reachable = r.ok;
+  } catch {
+    reachable = false;
+  }
+  if (reachable) {
+    push("opencode-server", "PASS", `${serverUrl} reachable`, null);
+  } else {
+    push("opencode-server", "WARN", `${serverUrl} not reachable`,
+      "Start it: opencode serve --port 4096 &");
+  }
+}
+
+// Agy-backend analogue of the opencode checks above: binary, auth token,
+// and the permissions.allow list (headless agy auto-denies tool calls that
+// are not allow-listed — the agy equivalent of the opencode.json footgun).
+async function doctorAgyChecks(push) {
+  const cap = await getCapability();
+
+  if (cap.version) {
+    push("agy-binary", "PASS", `${cap.binary} ${cap.version}`, null);
+  } else {
+    push("agy-binary", "FAIL", "not usable",
+      cap.problems[0] ?? "Install agy and ensure it is on PATH");
+  }
+
+  if (cap.authPresent) {
+    push("agy-auth", "PASS", "auth token present", null);
+  } else {
+    push("agy-auth", "FAIL",
+      cap.problems.find((p) => /auth token/.test(p)) ?? "no auth token",
+      "Run agy interactively once to authenticate");
+  }
+
+  const settings = readAgySettings();
+  if (settings.allow.length > 0) {
+    push("agy-allowlist", "PASS",
+      `${settings.path} (${settings.allow.length} allow rules)`, null);
+  } else {
+    push("agy-allowlist", "WARN",
+      settings.exists
+        ? `${settings.path} — permissions.allow is empty`
+        : `${settings.path} — file missing`,
+      "Headless agy auto-denies tool calls without allow rules; add scoped command(...) rules (never --dangerously-skip-permissions)");
+  }
+}
+
 // ------------------------------------------------------------------
 // Config (resolved settings dump — easier onboarding than reading source)
 // ------------------------------------------------------------------
@@ -956,6 +1034,11 @@ async function handleConfig(argv) {
   const wantJson = !!options.json;
 
   const envSpec = [
+    ["OPENCODE_BACKEND",          "opencode", "Transport backend: opencode | agy"],
+    ["AGY_BINARY",                "agy", "agy binary override"],
+    ["AGY_MODEL",                 "(unset)", "Default agy model (per-call --model wins)"],
+    ["AGY_EFFORT",                "(unset)", "Default agy reasoning effort: low|medium|high"],
+    ["AGY_PRINT_TIMEOUT_MS",      "(OPENCODE_PROMPT_TIMEOUT_MS)", "agy --print absolute cap"],
     ["OPENCODE_REQUEST_TIMEOUT_MS", "1800000", "Per-HTTP-request abort timeout"],
     ["OPENCODE_PROMPT_TIMEOUT_MS",  "14400000", "sendPrompt absolute cap (race against server 5min body-close)"],
     ["OPENCODE_IDLE_TIMEOUT_MS",    "900000", "Session idle watchdog (no activity → abort)"],
@@ -981,14 +1064,22 @@ async function handleConfig(argv) {
   const sRoot = stateRoot(workspace);
   const cfg = readOpencodeConfig();
   const missing = missingPermissions(cfg.data);
-  const serverUrl = "http://127.0.0.1:4096";
+  // Agy backend has no server: report the capability check instead of the
+  // opencode health endpoint. Opencode path below is untouched.
+  const backend = resolveBackendName();
+  const serverUrl = backend === "agy" ? "agy:cli" : "http://127.0.0.1:4096";
   let serverReachable = false;
-  try {
-    const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
-    serverReachable = r.ok;
-  } catch {}
+  if (backend === "agy") {
+    serverReachable = await isServerRunning();
+  } else {
+    try {
+      const r = await fetch(`${serverUrl}/global/health`, { signal: AbortSignal.timeout(2000) });
+      serverReachable = r.ok;
+    } catch {}
+  }
 
   const out = {
+    backend,
     env: envRows,
     workspace,
     stateRoot: sRoot,
@@ -1007,6 +1098,7 @@ async function handleConfig(argv) {
   }
 
   console.log("## OpenCode Companion Config\n");
+  console.log(`- Backend: ${backend} (OPENCODE_BACKEND)`);
   console.log(`- Workspace: ${workspace}`);
   console.log(`- State dir: ${sRoot}`);
   console.log(`- Config file: ${cfg.path} (${cfg.exists ? "exists" : "missing"}${missing.length ? ", missing: " + missing.join(",") : ", permissions OK"})`);

@@ -4,7 +4,7 @@
 // Called on SessionStart and SessionEnd events to manage the OpenCode server.
 
 import process from "node:process";
-import { isServerRunning } from "./lib/opencode-server.mjs";
+import { isServerRunning, resolveBackendName } from "./lib/backend.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
 
@@ -14,10 +14,11 @@ async function main() {
   const workspace = await resolveWorkspace();
 
   if (event === "SessionStart") {
-    // Check if OpenCode server is available (but don't auto-start it)
+    // Check if the active backend is available (but don't auto-start it)
     const running = await isServerRunning();
     if (running) {
-      process.stderr.write("[opencode-companion] OpenCode server detected.\n");
+      const label = resolveBackendName() === "agy" ? "agy CLI" : "OpenCode server";
+      process.stderr.write(`[opencode-companion] ${label} detected.\n`);
     }
   }
 

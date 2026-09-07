@@ -92,3 +92,19 @@ export async function getChangedFiles(cwd, opts = {}) {
   const { stdout } = await runCommand("git", args, { cwd });
   return stdout.trim().split("\n").filter(Boolean);
 }
+
+/**
+ * Get untracked files (not yet added to git), respecting .gitignore.
+ * `git diff` never reports these, so callers that want a full picture of
+ * what a task changed (tracked edits + brand-new files) need both.
+ * @param {string} cwd
+ * @returns {Promise<string[]>}
+ */
+export async function getUntrackedFiles(cwd) {
+  const { stdout } = await runCommand(
+    "git",
+    ["ls-files", "--others", "--exclude-standard"],
+    { cwd }
+  );
+  return stdout.trim().split("\n").filter(Boolean);
+}
