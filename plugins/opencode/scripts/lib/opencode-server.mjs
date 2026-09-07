@@ -3,6 +3,9 @@
 // OpenCode exposes a REST API + SSE. This module wraps that API.
 
 import { spawn, spawnSync } from "node:child_process";
+import fsp from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 
 // Re-export for spec-compliance / discoverability: probeSessionTerminal lives
 // in auto-heal.mjs because it is tightly coupled to heal-decision logic, but
@@ -25,12 +28,19 @@ const PROMPT_TIMEOUT_MS = Number(process.env.OPENCODE_PROMPT_TIMEOUT_MS) || 14_4
 const STRICT_TERMINAL = process.env.OPENCODE_STRICT_TERMINAL === "1";
 // How long a session may go without ANY activity signal before we assume it
 // is stuck. Activity = new message, new parts, tool output growth, status
-// change. Default 1h - long enough for silent-but-live tool subprocesses.
-const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 3_600_000;
+// change. Previously defaulted to 1h, but with MAX_IDLE_EXTENSIONS that meant
+// a hung session could tie up a worker slot for 3 hours before giving up or
+// falling back. 10 minutes gives silent tool invocations plenty of headroom
+// while bounding the worst-case stall.
+const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 600_000;
 // Maximum consecutive idle extensions granted when opencode serve has live
 // child processes. Prevents a stuck or sleeping child from suppressing the
 // idle timeout forever.
 const MAX_IDLE_EXTENSIONS = Number(process.env.OPENCODE_MAX_IDLE_EXTENSIONS) || 2;
+// An incomplete assistant message with zero tokens and zero parts that sits
+// silent for this long indicates the provider rejected or dropped the stream
+// without surfacing an error to the session API (e.g. rate limit exceeded).
+const STREAM_STALL_MS = Number(process.env.OPENCODE_STREAM_STALL_MS) || 90_000;
 // Bash-tool "no child process" consecutive-miss threshold. If the latest
 // tool is a bash in status=running but opencode serve has zero child
 // processes for N polls in a row, declare stuck. 3 × 5s = 15s grace.
@@ -146,6 +156,94 @@ export function detectQuotaNotice(msg) {
   }
 
   return null;
+}
+
+/**
+ * Resolve the path to opencode's server log.
+ * Resolved via a helper so it can be overridden in tests via OPENCODE_LOG_PATH.
+ *
+ * @returns {string}
+ */
+export function resolveOpencodeLogPath() {
+  return (
+    process.env.OPENCODE_LOG_PATH ||
+    path.join(os.homedir(), ".local", "share", "opencode", "log", "opencode.log")
+  );
+}
+
+/**
+ * Parse out the error value from opencode server log lines matching the session id and level=ERROR.
+ * Scans backwards so the newest error line is preferred.
+ *
+ * @param {string} content
+ * @param {string} sessionId
+ * @returns {string|null}
+ */
+export function parseOpencodeLogError(content, sessionId) {
+  if (!content || !sessionId) return null;
+  const lines = content.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || !line.includes("level=ERROR") || !line.includes(sessionId)) continue;
+
+    // Extract error.error="..." or error.error=...
+    const m = line.match(/error\.error="([^"]+)"/) || line.match(/error\.error=([^\s]+)/);
+    if (m) {
+      let errStr = m[1];
+      if (errStr.startsWith("AI_APICallError: ")) {
+        errStr = errStr.slice("AI_APICallError: ".length).trim();
+      }
+      return errStr || null;
+    }
+    const msgMatch = line.match(/message="([^"]+)"/) || line.match(/message=([^\s]+)/);
+    return msgMatch ? msgMatch[1] : "opencode stream error";
+  }
+  return null;
+}
+
+/**
+ * Read opencode's server log and return any error matching sessionId.
+ * Tolerates the file being absent or unreadable, reads only the tail up to
+ * 256KB, and caps read time to 1500ms so a slow read never blocks the watcher.
+ *
+ * @param {string} sessionId
+ * @param {string} [logPath]
+ * @returns {Promise<string|null>}
+ */
+export async function readOpencodeLogError(sessionId, logPath = resolveOpencodeLogPath()) {
+  if (!sessionId || !logPath) return null;
+
+  let timeoutId;
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutId = setTimeout(() => resolve(null), 1500);
+  });
+
+  const readPromise = (async () => {
+    try {
+      const stat = await fsp.stat(logPath).catch(() => null);
+      if (!stat || !stat.isFile() || stat.size === 0) return null;
+
+      const readSize = Math.min(stat.size, 262_144);
+      const offset = stat.size - readSize;
+      const buf = Buffer.alloc(readSize);
+
+      const handle = await fsp.open(logPath, "r");
+      try {
+        await handle.read(buf, 0, readSize, offset);
+      } finally {
+        await handle.close();
+      }
+      return parseOpencodeLogError(buf.toString("utf8"), sessionId);
+    } catch {
+      return null;
+    }
+  })();
+
+  try {
+    return await Promise.race([readPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /**
@@ -315,6 +413,12 @@ export function createClient(baseUrl, opts = {}) {
         ? Number(process.env.OPENCODE_MIN_POLL_DELAY_MS)
         : 5_000;
       const POLL_INTERVAL_MS = Number(process.env.OPENCODE_COMPLETION_POLL_MS) || 5_000;
+      const streamStallMs = process.env.OPENCODE_STREAM_STALL_MS !== undefined
+        ? Number(process.env.OPENCODE_STREAM_STALL_MS)
+        : STREAM_STALL_MS;
+      const idleTimeoutMs = process.env.OPENCODE_IDLE_TIMEOUT_MS !== undefined
+        ? Number(process.env.OPENCODE_IDLE_TIMEOUT_MS)
+        : IDLE_TIMEOUT_MS;
 
       const fetchPromise = (async () => {
         const res = await fetch(`${baseUrl}/session/${sessionId}/message`, {
@@ -395,6 +499,15 @@ export function createClient(baseUrl, opts = {}) {
                 throw err;
               }
 
+              // Server log signal: opencode writes stream errors directly to
+              // its server log even when GET /session/:id/message leaves error null.
+              const logError = await readOpencodeLogError(sessionId);
+              if (logError) {
+                const err = new Error(logError);
+                ac.abort(err);
+                throw err;
+              }
+
               // Completion signal: assistant message created after our prompt
               // started. Some OpenCode versions omit `finish` on terminal messages.
               if (
@@ -404,6 +517,32 @@ export function createClient(baseUrl, opts = {}) {
                 (STRICT_TERMINAL ? hasTerminalFinish : hasTerminalFinish || completed > 0)
               ) {
                 return { source: "watcher", data: last };
+              }
+
+              // Stream stall detection: an incomplete assistant message with 0 input
+              // tokens and 0 parts older than STREAM_STALL_MS never reached the model.
+              // A live stream produces its first part within seconds.
+              const role = info?.role ?? last?.role;
+              const tokens = info?.tokens ?? last?.tokens;
+              const time = info?.time ?? last?.time;
+              const created = typeof time?.created === "number" ? time.created : 0;
+              const isIncompleteAssistant =
+                role === "assistant" &&
+                !hasTerminalFinish &&
+                completed === 0;
+
+              if (
+                isIncompleteAssistant &&
+                parts.length === 0 &&
+                Number(tokens?.input ?? 0) === 0 &&
+                created > 0 &&
+                (Date.now() - created) >= streamStallMs
+              ) {
+                const stallSec = Math.floor(streamStallMs / 1000);
+                const desc = `opencode stream stalled: no tokens and no parts after ${stallSec}s (provider likely rate limited)`;
+                const err = new Error(desc);
+                ac.abort(err);
+                throw err;
               }
 
               // Bash-tool stuck detector: latest tool is bash in status=running
@@ -437,7 +576,7 @@ export function createClient(baseUrl, opts = {}) {
               // Covers all tool types (not just bash), including non-pgrep
               // platforms (Windows).
               const idleMs = Date.now() - lastActivityMs;
-              if (idleMs > IDLE_TIMEOUT_MS) {
+              if (idleMs > idleTimeoutMs) {
                 const liveChildren = opencodePid ? countChildren(opencodePid) : 0;
                 if (liveChildren > 0 && idleExtensions < MAX_IDLE_EXTENSIONS) {
                   idleExtensions += 1;
@@ -448,7 +587,7 @@ export function createClient(baseUrl, opts = {}) {
                 } else {
                   const reason = liveChildren > 0
                     ? `session idle timeout: exceeded max extensions (${MAX_IDLE_EXTENSIONS}) with ${liveChildren} child process(es) alive`
-                    : `session idle timeout: ${Math.floor(idleMs / 1000)}s > ${IDLE_TIMEOUT_MS / 1000}s`;
+                    : `session idle timeout: ${Math.floor(idleMs / 1000)}s > ${idleTimeoutMs / 1000}s`;
                   const err = new Error(reason);
                   ac.abort(err);
                   throw err;
@@ -565,4 +704,8 @@ export const __test = {
   resolveServePid,
   IDLE_TIMEOUT_MS,
   MAX_IDLE_EXTENSIONS,
+  STREAM_STALL_MS,
+  resolveOpencodeLogPath,
+  parseOpencodeLogError,
+  readOpencodeLogError,
 };

@@ -71,6 +71,8 @@ const TRANSPORT_PATTERNS = [
   // timeouts: prompt-level deadline or session stall
   /prompt timeout/i,
   /session idle/i,
+  /stream stall/i,
+  /stream error/i,
   // the run produced nothing at all
   /no output produced/i,
   /empty response/i,

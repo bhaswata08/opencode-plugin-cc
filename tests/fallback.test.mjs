@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import {
   FALLBACKS,
   resolveFallback,
@@ -11,6 +14,10 @@ import {
 import {
   detectQuotaNotice,
   createClient,
+  parseOpencodeLogError,
+  readOpencodeLogError,
+  resolveOpencodeLogPath,
+  __test,
 } from "../plugins/opencode/scripts/lib/opencode-server.mjs";
 
 test("every seat the user configured has a fallback", () => {
@@ -51,6 +58,9 @@ test("transport failures are recognised", () => {
     new Error("opencode rate limit / quota exceeded: Free usage exceeded, subscribe to Go"),
     new Error("opencode rate limit / quota exceeded: retrying in 52049s - attempt #1"),
     new Error("opencode rate limit / quota exceeded: provider rate limit (status 429)"),
+    new Error("opencode stream stalled: no tokens and no parts after 90s (provider likely rate limited)"),
+    new Error("opencode stream stalled: no tokens and no parts after 90s"),
+    new Error("Rate limit exceeded. Please try again later."),
   ];
   for (const err of yes) {
     assert.equal(isTransportFailure(err), true, `should be transport: ${err.message}`);
@@ -480,4 +490,198 @@ test("prompt timeout triggers runWithFallback to retry on agy", async () => {
   });
   assert.equal(out.usedFallback, true);
   assert.equal(out.value, "recovered after prompt timeout");
+});
+
+test("parseOpencodeLogError extracts error.error and strips AI_APICallError prefix", () => {
+  const sid = "ses_f841ce2d3ffeWiSyQozsPIXXrq";
+  const logContent = [
+    'timestamp=2026-09-07T12:40:00.000Z level=INFO message="session created" session.id=' + sid,
+    'timestamp=2026-09-07T12:41:19.826Z level=ERROR message="stream error" providerID=opencode modelID=muse-spark-1.3-contributor-free session.id=' + sid + ' error.error="AI_APICallError: Rate limit exceeded. Please try again later."',
+    'timestamp=2026-09-07T12:42:00.000Z level=INFO message="heartbeat"',
+  ].join("\n");
+
+  const err = parseOpencodeLogError(logContent, sid);
+  assert.equal(err, "Rate limit exceeded. Please try again later.");
+
+  // Non-matching session returns null
+  assert.equal(parseOpencodeLogError(logContent, "ses_other"), null);
+
+  // Plain error without AI_APICallError prefix
+  const plainLog = 'timestamp=... level=ERROR session.id=ses_test error.error="Direct error message"';
+  assert.equal(parseOpencodeLogError(plainLog, "ses_test"), "Direct error message");
+
+  // Missing error.error field falls back to message
+  const msgLog = 'timestamp=... level=ERROR session.id=ses_test message="stream failed abruptly"';
+  assert.equal(parseOpencodeLogError(msgLog, "ses_test"), "stream failed abruptly");
+});
+
+test("readOpencodeLogError handles missing, empty, and valid files", async () => {
+  // Missing file
+  const missing = await readOpencodeLogError("ses_test", "/path/to/definitely/nonexistent/log.log");
+  assert.equal(missing, null);
+
+  // Valid fixture file
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "octest-"));
+  const logFile = path.join(tmpDir, "opencode.log");
+  try {
+    fs.writeFileSync(
+      logFile,
+      'timestamp=2026-09-07T12:41:19.826Z level=ERROR message="stream error" session.id=ses_fix1 error.error="AI_APICallError: Rate limit exceeded. Please try again later."\n',
+      "utf8",
+    );
+    const parsed = await readOpencodeLogError("ses_fix1", logFile);
+    assert.equal(parsed, "Rate limit exceeded. Please try again later.");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("sendPrompt watcher aborts on stalled stream (zero tokens, zero parts, past threshold)", async () => {
+  const originalFetch = global.fetch;
+  const originalDelay = process.env.OPENCODE_MIN_POLL_DELAY_MS;
+  const originalInterval = process.env.OPENCODE_COMPLETION_POLL_MS;
+  const originalStall = process.env.OPENCODE_STREAM_STALL_MS;
+  process.env.OPENCODE_MIN_POLL_DELAY_MS = "10";
+  process.env.OPENCODE_COMPLETION_POLL_MS = "10";
+  process.env.OPENCODE_STREAM_STALL_MS = "50";
+
+  try {
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/message")) {
+        return new Promise((_, reject) => {
+          if (init?.signal?.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal.reason);
+          });
+        });
+      }
+      if (u.includes("/message?limit=1")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              role: "assistant",
+              error: null,
+              parts: [],
+              model: "muse-spark-1.3-contributor-free",
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              time: { created: Date.now() - 100 },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    const client = createClient("http://127.0.0.1:4096");
+    let caughtErr = null;
+    try {
+      await client.sendPrompt("sess-stall-1", "test prompt");
+    } catch (err) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, "expected sendPrompt to abort on stalled stream");
+    assert.match(caughtErr.message, /stream stalled: no tokens and no parts/i);
+    assert.equal(isTransportFailure(caughtErr), true, "stalled stream must be classified as a transport failure");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalDelay !== undefined) process.env.OPENCODE_MIN_POLL_DELAY_MS = originalDelay;
+    else delete process.env.OPENCODE_MIN_POLL_DELAY_MS;
+    if (originalInterval !== undefined) process.env.OPENCODE_COMPLETION_POLL_MS = originalInterval;
+    else delete process.env.OPENCODE_COMPLETION_POLL_MS;
+    if (originalStall !== undefined) process.env.OPENCODE_STREAM_STALL_MS = originalStall;
+    else delete process.env.OPENCODE_STREAM_STALL_MS;
+  }
+});
+
+test("sendPrompt watcher aborts promptly when server log records an error for the session", async () => {
+  const originalFetch = global.fetch;
+  const originalDelay = process.env.OPENCODE_MIN_POLL_DELAY_MS;
+  const originalInterval = process.env.OPENCODE_COMPLETION_POLL_MS;
+  const originalLogPath = process.env.OPENCODE_LOG_PATH;
+  process.env.OPENCODE_MIN_POLL_DELAY_MS = "10";
+  process.env.OPENCODE_COMPLETION_POLL_MS = "10";
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "octest-log-"));
+  const logFile = path.join(tmpDir, "opencode.log");
+  process.env.OPENCODE_LOG_PATH = logFile;
+
+  try {
+    fs.writeFileSync(
+      logFile,
+      'timestamp=2026-09-07T12:41:19.826Z level=ERROR message="stream error" providerID=opencode modelID=muse-spark-1.3-contributor-free session.id=sess-log-err-1 error.error="AI_APICallError: Rate limit exceeded. Please try again later."\n',
+      "utf8",
+    );
+
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/message")) {
+        return new Promise((_, reject) => {
+          if (init?.signal?.aborted) {
+            reject(init.signal.reason);
+            return;
+          }
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal.reason);
+          });
+        });
+      }
+      if (u.includes("/message?limit=1")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              role: "assistant",
+              error: null,
+              parts: [],
+              time: { created: Date.now() },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    const client = createClient("http://127.0.0.1:4096");
+    let caughtErr = null;
+    try {
+      await client.sendPrompt("sess-log-err-1", "test prompt");
+    } catch (err) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, "expected sendPrompt to abort on server log error");
+    assert.match(caughtErr.message, /Rate limit exceeded\. Please try again later\./);
+    assert.equal(isTransportFailure(caughtErr), true, "log rate limit must be classified as transport failure");
+  } finally {
+    global.fetch = originalFetch;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (originalDelay !== undefined) process.env.OPENCODE_MIN_POLL_DELAY_MS = originalDelay;
+    else delete process.env.OPENCODE_MIN_POLL_DELAY_MS;
+    if (originalInterval !== undefined) process.env.OPENCODE_COMPLETION_POLL_MS = originalInterval;
+    else delete process.env.OPENCODE_COMPLETION_POLL_MS;
+    if (originalLogPath !== undefined) process.env.OPENCODE_LOG_PATH = originalLogPath;
+    else delete process.env.OPENCODE_LOG_PATH;
+  }
+});
+
+test("stalled stream error triggers runWithFallback to retry on agy", async () => {
+  let calls = 0;
+  const out = await runWithFallback({
+    agent: "coder",
+    attempt: async (sel) => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("opencode stream stalled: no tokens and no parts after 90s (provider likely rate limited)");
+      }
+      return { text: "recovered on fallback", value: "recovered on fallback" };
+    },
+  });
+  assert.equal(out.usedFallback, true);
+  assert.equal(out.value, "recovered on fallback");
 });
