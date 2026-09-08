@@ -76,7 +76,9 @@ import { getChangedFiles, getUntrackedFiles } from "./git.mjs";
 // Env conventions (mirror the OPENCODE_*_TIMEOUT_MS pattern)
 // ---------------------------------------------------------------------------
 
-const AGY_BINARY = process.env.AGY_BINARY || "agy";
+function agyBinary() {
+  return process.env.AGY_BINARY || "agy";
+}
 
 // Windows shell note (verified reasoning, F2): agy is a native binary, not an
 // npm shim (unlike `opencode`, which needs shell:true to reach its .cmd
@@ -561,27 +563,131 @@ function authTokenPresent() {
   }
 }
 
-function runBinary(args, { timeoutMs = 15_000 } = {}) {
+export const EXIT_DRAIN_GRACE_MS = 500;
+
+export function waitForProcess(proc, {
+  timeoutMs = printTimeoutMs(),
+  graceMs = EXIT_DRAIN_GRACE_MS,
+  onTimeout = null,
+} = {}) {
   return new Promise((resolve) => {
-    const proc = spawn(AGY_BINARY, args, {
+    let settled = false;
+    let exitCode = null;
+    let timer = null;
+    let graceTimer = null;
+
+    function settle(code) {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+      resolve(code ?? 1);
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (onTimeout) {
+          onTimeout();
+        } else {
+          try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+          // Escalate so a wedged child cannot outlive the timeout. Unref'd:
+          // the primary close/error handlers below already settle the wait.
+          const esc = setTimeout(() => {
+            try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+            const hard = setTimeout(() => settle(1), 2_000);
+            hard.unref?.();
+          }, 10_000);
+          esc.unref?.();
+        }
+      }, timeoutMs);
+    }
+
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      exitCode = proc.exitCode ?? (proc.signalCode ? 1 : 0);
+      graceTimer = setTimeout(() => {
+        settle(exitCode);
+      }, graceMs);
+      graceTimer.unref?.();
+    } else {
+      proc.on("exit", (code, signal) => {
+        exitCode = code ?? (signal ? 1 : 0);
+        graceTimer = setTimeout(() => {
+          settle(exitCode);
+        }, graceMs);
+        graceTimer.unref?.();
+      });
+    }
+
+    proc.on("close", (code) => {
+      settle(code ?? exitCode ?? 0);
+    });
+
+    proc.on("error", () => {
+      settle(1);
+    });
+  });
+}
+
+export function runBinary(args, { timeoutMs = 15_000 } = {}) {
+  const bin = agyBinary();
+  return new Promise((resolve) => {
+    const proc = spawn(bin, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      shell: needsWindowsShell(AGY_BINARY),
+      shell: needsWindowsShell(bin),
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let exitCode = null;
+    let graceTimer = null;
+
     const timer = setTimeout(() => {
       try { proc.kill("SIGKILL"); } catch { /* already gone */ }
-      resolve({ stdout, stderr: `${stderr}\n(timed out after ${timeoutMs}ms)`, exitCode: 1 });
+      settle(1, `${stderr}\n(timed out after ${timeoutMs}ms)`);
     }, timeoutMs);
+
+    function settle(code, errText) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
+      resolve({
+        stdout,
+        stderr: errText !== undefined ? errText : stderr,
+        exitCode: code ?? 1,
+      });
+    }
+
     proc.stdout.on("data", (d) => (stdout += d));
     proc.stderr.on("data", (d) => (stderr += d));
+
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      exitCode = proc.exitCode ?? (proc.signalCode ? 1 : 0);
+      graceTimer = setTimeout(() => settle(exitCode), EXIT_DRAIN_GRACE_MS);
+      graceTimer.unref?.();
+    } else {
+      proc.on("exit", (code, signal) => {
+        exitCode = code ?? (signal ? 1 : 0);
+        graceTimer = setTimeout(() => settle(exitCode), EXIT_DRAIN_GRACE_MS);
+        graceTimer.unref?.();
+      });
+    }
+
     proc.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ stdout, stderr, exitCode: code ?? 1 });
+      settle(code ?? exitCode ?? 0);
     });
+
     proc.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ stdout: "", stderr: String(err), exitCode: 1 });
+      settle(1, String(err));
     });
   });
 }
@@ -592,12 +698,13 @@ function runBinary(args, { timeoutMs = 15_000 } = {}) {
  * @returns {Promise<{ ok: boolean, binary: string, version: string|null, authPresent: boolean, problems: string[] }>}
  */
 export async function getCapability() {
+  const bin = agyBinary();
   const problems = [];
   const r = await runBinary(["--version"]);
   const version = r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim().split("\n")[0].trim() : null;
   if (!version) {
     problems.push(
-      `agy binary not usable ("${AGY_BINARY} --version" failed${r.stderr.trim() ? `: ${r.stderr.trim().slice(0, 200)}` : ""}). Install agy and ensure it is on PATH.`,
+      `agy binary not usable ("${bin} --version" failed${r.stderr.trim() ? `: ${r.stderr.trim().slice(0, 200)}` : ""}). Install agy and ensure it is on PATH.`,
     );
   }
   const authPresent = authTokenPresent();
@@ -606,7 +713,7 @@ export async function getCapability() {
       `no agy auth token at ${path.join(settingsDir(), "antigravity-oauth-token")}. Run agy interactively once to authenticate.`,
     );
   }
-  return { ok: problems.length === 0, binary: AGY_BINARY, version, authPresent, problems };
+  return { ok: problems.length === 0, binary: bin, version, authPresent, problems };
 }
 
 /** @returns {Promise<boolean>} */
@@ -775,12 +882,13 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       });
 
       const startedAt = Date.now();
-      const proc = spawn(AGY_BINARY, args, {
+      const bin = agyBinary();
+      const proc = spawn(bin, args, {
         // stdin from /dev/null: older agy builds blocked on piped stdin.
         stdio: ["ignore", "pipe", "pipe"],
         cwd: directory,
         env: { ...process.env },
-        shell: needsWindowsShell(AGY_BINARY),
+        shell: needsWindowsShell(bin),
       });
       const entry = trackProc(sessionId ?? null, proc);
       let stdout = "";
@@ -823,17 +931,7 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       });
       proc.stderr.on("data", (d) => (stderr += d));
 
-      const exitCode = await new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          try { proc.kill("SIGTERM"); } catch { /* already gone */ }
-          // Escalate so a wedged child cannot outlive the timeout. Unref'd:
-          // the primary close/error handlers below already settle the wait.
-          const esc = setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } }, 10_000);
-          esc.unref?.();
-        }, timeoutMs);
-        proc.on("close", (code) => { clearTimeout(timer); resolve(code ?? 1); });
-        proc.on("error", () => { clearTimeout(timer); resolve(1); });
-      });
+      const exitCode = await waitForProcess(proc, { timeoutMs });
       untrack(entry);
 
       // Process any trailing buffered line after process exit
@@ -986,4 +1084,11 @@ export async function connect(opts = {}) {
 }
 
 // Test-only escape hatch (lets tests assert the timeout knob resolution).
-export const __test = { printTimeoutMs, settingsDir, needsWindowsShell };
+export const __test = {
+  printTimeoutMs,
+  settingsDir,
+  needsWindowsShell,
+  waitForProcess,
+  EXIT_DRAIN_GRACE_MS,
+  runBinary,
+};

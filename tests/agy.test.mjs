@@ -6,7 +6,7 @@
 
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +32,9 @@ import {
   readAgySettings,
   DEFAULT_GEMINIIGNORE,
   ensureWorkspaceGeminiignore,
+  waitForProcess,
+  EXIT_DRAIN_GRACE_MS,
+  runBinary,
   __test,
 } from "../plugins/opencode/scripts/lib/agy-runner.mjs";
 import {
@@ -999,3 +1002,289 @@ describe("handler-level: agy task persists the learned session id", () => {
     assert.equal(job.opencodeSessionId, "fresh-conv-123");
   });
 });
+
+describe("agy process wait and grandchild pipe inheritance", () => {
+  it("the reproduction above, now passing", async () => {
+    // Spawn a plain node child with piped stdio that itself spawns a detached
+    // grandchild inheriting those pipes, then have the child exit while the
+    // grandchild lives a few seconds.
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `import { spawn } from "node:child_process";
+         const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+           detached: true,
+           stdio: ["ignore", 1, 2]
+         });
+         gc.unref();
+         console.log(JSON.stringify({ gcPid: gc.pid, msg: "child finished" }));
+         process.exit(0);`,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    let gcPid = null;
+    let stdoutText = "";
+    child.stdout.on("data", (chunk) => {
+      const s = chunk.toString();
+      stdoutText += s;
+      try {
+        const obj = JSON.parse(s.trim());
+        if (obj.gcPid) gcPid = obj.gcPid;
+      } catch {}
+    });
+
+    let childExited = false;
+    let childClosed = false;
+    child.on("exit", () => { childExited = true; });
+    child.on("close", () => { childClosed = true; });
+
+    let closeOnlySettled = false;
+    const closeOnlyWait = new Promise((resolve) => {
+      child.on("close", (code) => {
+        closeOnlySettled = true;
+        resolve(code ?? 1);
+      });
+    });
+
+    const runnerWait = waitForProcess(child, { timeoutMs: 10_000, graceMs: 500 });
+
+    try {
+      // Wait for child process to exit (fires within ~50ms).
+      await new Promise((resolve) => {
+        if (child.exitCode !== null) resolve();
+        else child.on("exit", resolve);
+      });
+
+      assert.equal(childExited, true, "child process must have exited");
+      assert.equal(childClosed, false, "child stdio pipes must still be held open by grandchild");
+
+      // Check whether close-only wait settled at 1200ms
+      const closeResult = await Promise.race([
+        closeOnlyWait.then((code) => ({ settled: true, code })),
+        new Promise((resolve) => setTimeout(() => resolve({ settled: false }), 1200)),
+      ]);
+      assert.equal(closeResult.settled, false, "close-only wait must NOT settle when child exits because pipes remain open");
+      assert.equal(closeOnlySettled, false, "close-only wait is still pending");
+
+      // Under an exit-based wait with grace period, runnerWait settles shortly after child exit.
+      const runnerResult = await Promise.race([
+        runnerWait.then((code) => ({ settled: true, code })),
+        new Promise((resolve) => setTimeout(() => resolve({ settled: false }), 1200)),
+      ]);
+
+      assert.equal(
+        runnerResult.settled,
+        true,
+        "exit-based wait must settle when child exits without waiting for grandchild to close pipes",
+      );
+      assert.equal(runnerResult.code, 0, "must resolve with child exit code 0");
+    } finally {
+      if (gcPid) {
+        try { process.kill(gcPid, "SIGKILL"); } catch {}
+      }
+    }
+  });
+
+  it("exit before close resolves with the correct exit code", async () => {
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `import { spawn } from "node:child_process";
+         const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+           detached: true,
+           stdio: ["ignore", 1, 2]
+         });
+         gc.unref();
+         console.log(JSON.stringify({ gcPid: gc.pid }));
+         process.exit(42);`,
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    let gcPid = null;
+    child.stdout.on("data", (chunk) => {
+      try {
+        const obj = JSON.parse(chunk.toString().trim());
+        if (obj.gcPid) gcPid = obj.gcPid;
+      } catch {}
+    });
+
+    try {
+      const code = await waitForProcess(child, { timeoutMs: 10_000, graceMs: 200 });
+      assert.equal(code, 42, "must resolve with the child process exit code (42)");
+    } finally {
+      if (gcPid) {
+        try { process.kill(gcPid, "SIGKILL"); } catch {}
+      }
+    }
+  });
+
+  it("output already buffered when exit fires still reaches the caller and is not truncated", async () => {
+    const expectedLines = [];
+    for (let i = 0; i < 40; i++) {
+      expectedLines.push(`{"index":${i},"payload":"data-chunk-${"x".repeat(30)}"}`);
+    }
+    const script = `import { spawn } from "node:child_process";
+      const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: ["ignore", 1, 2]
+      });
+      gc.unref();
+      console.log(JSON.stringify({ gcPid: gc.pid }));
+      const lines = ${JSON.stringify(expectedLines)};
+      for (const line of lines) {
+        console.log(line);
+      }
+      process.exit(0);`;
+
+    const child = spawn(
+      process.execPath,
+      ["-e", script],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    let gcPid = null;
+    let stdoutBuffer = "";
+    child.stdout.on("data", (chunk) => {
+      stdoutBuffer += chunk.toString();
+      try {
+        const firstLine = stdoutBuffer.split("\n")[0].trim();
+        const obj = JSON.parse(firstLine);
+        if (obj.gcPid && !gcPid) gcPid = obj.gcPid;
+      } catch {}
+    });
+
+    try {
+      const code = await waitForProcess(child, { timeoutMs: 10_000, graceMs: 300 });
+      assert.equal(code, 0);
+
+      const receivedLines = stdoutBuffer
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      // Line 0 is gcPid, lines 1..40 are the expectedLines
+      assert.ok(receivedLines.length >= expectedLines.length + 1);
+      for (let i = 0; i < expectedLines.length; i++) {
+        assert.equal(receivedLines[i + 1], expectedLines[i]);
+      }
+    } finally {
+      if (gcPid) {
+        try { process.kill(gcPid, "SIGKILL"); } catch {}
+      }
+    }
+  });
+
+  it("close arriving normally still resolves exactly once, unchanged", async () => {
+    const start = Date.now();
+    const child = spawn(
+      process.execPath,
+      ["-e", "console.log('clean-finish'); process.exit(0);"],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    let stdout = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+
+    const code = await waitForProcess(child, { timeoutMs: 10_000, graceMs: 2_000 });
+    const elapsed = Date.now() - start;
+
+    assert.equal(code, 0);
+    assert.equal(stdout.trim(), "clean-finish");
+    // Normal close should resolve immediately without waiting out the 2000ms grace period
+    assert.ok(elapsed < 1000, `expected normal close to settle fast, took ${elapsed}ms`);
+  });
+
+  it("the promise settles once, not twice, when both events fire", async () => {
+    const child = spawn(
+      process.execPath,
+      ["-e", "process.exit(0);"],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    let settleCount = 0;
+    const waitPromise = waitForProcess(child, { timeoutMs: 10_000, graceMs: 200 });
+    waitPromise.then(() => {
+      settleCount++;
+    });
+
+    const code = await waitPromise;
+    assert.equal(code, 0);
+
+    // Wait past the grace period to ensure no duplicate resolution happens
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    assert.equal(settleCount, 1, "promise must settle exactly once");
+  });
+
+  it("a child that produces no output and never exits is still killed by the existing timeout path", async () => {
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000);"],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+
+    const start = Date.now();
+    const code = await waitForProcess(child, { timeoutMs: 300, graceMs: 100 });
+    const elapsed = Date.now() - start;
+
+    // Timeout killed child with SIGTERM, resolving non-zero exit code
+    assert.notEqual(code, 0);
+    assert.ok(elapsed >= 300, `expected timeout >= 300ms, took ${elapsed}ms`);
+    assert.ok(elapsed < 2500, `expected prompt termination, took ${elapsed}ms`);
+
+    // Verify child process is dead
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.throws(() => {
+      process.kill(child.pid, 0);
+    });
+  });
+
+  it("runBinary settles when process exits even if grandchild holds pipes open", async () => {
+    setEnv({ AGY_BINARY: process.execPath });
+    const script = `import { spawn } from "node:child_process";
+      const gc = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+        detached: true,
+        stdio: ["ignore", 1, 2]
+      });
+      gc.unref();
+      console.log("version-9.9.9-test " + gc.pid);
+      process.exit(0);`;
+
+    const start = Date.now();
+    const res = await runBinary(["-e", script], { timeoutMs: 10_000 });
+    const elapsed = Date.now() - start;
+
+    assert.equal(res.exitCode, 0);
+    assert.ok(res.stdout.includes("version-9.9.9-test"));
+    // Must settle within grace period (~500ms), not hang for the 10000ms timeout
+    assert.ok(elapsed < 2000, `runBinary must settle without hanging for grandchild, took ${elapsed}ms`);
+
+    const parts = res.stdout.trim().split(" ");
+    const gcPid = Number(parts[1]);
+    if (gcPid) {
+      try { process.kill(gcPid, "SIGKILL"); } catch {}
+    }
+  });
+});
+
