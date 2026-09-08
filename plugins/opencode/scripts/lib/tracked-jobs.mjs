@@ -26,6 +26,7 @@ export function getClaudeSessionId() {
 export function createJobRecord(workspacePath, type, meta = {}) {
   const id = generateJobId(type);
   const sessionId = getClaudeSessionId();
+  const logFile = meta.logFile || jobLogPath(workspacePath, id);
   const job = {
     id,
     type,
@@ -34,6 +35,7 @@ export function createJobRecord(workspacePath, type, meta = {}) {
     // Transport that created this job (OPENCODE_BACKEND at creation time),
     // so cancel/heal stay correct even if the env switches mid-A/B test.
     backend: resolveBackendName(),
+    logFile,
     ...meta,
   };
   upsertJob(workspacePath, job);
@@ -48,10 +50,11 @@ export function createJobRecord(workspacePath, type, meta = {}) {
  * @returns {Promise<object>} the job result
  */
 export async function runTrackedJob(workspacePath, job, runner) {
-  // Mark as running
-  upsertJob(workspacePath, { id: job.id, status: "running", pid: process.pid });
+  const logFile = job.logFile || jobLogPath(workspacePath, job.id);
 
-  const logFile = jobLogPath(workspacePath, job.id);
+  // Mark as running
+  upsertJob(workspacePath, { id: job.id, status: "running", pid: process.pid, logFile });
+
   ensureDir(path.dirname(logFile));
 
   const report = (phase, message) => {

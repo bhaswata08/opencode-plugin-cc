@@ -4,7 +4,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createTmpDir, cleanupTmpDir, setupTestEnv } from "./helpers.mjs";
 import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot } from "../plugins/opencode/scripts/lib/state.mjs";
-import { runTrackedJob, createProgressReporter } from "../plugins/opencode/scripts/lib/tracked-jobs.mjs";
+import { createJobRecord, runTrackedJob, createProgressReporter } from "../plugins/opencode/scripts/lib/tracked-jobs.mjs";
 
 let tmpDir;
 const workspace = "/test/workspace";
@@ -29,6 +29,64 @@ describe("state", () => {
     saveState(workspace, data);
     const loaded = loadState(workspace);
     assert.deepEqual(loaded, data);
+  });
+
+  it("saveState then loadState round-trips the workspace path", () => {
+    const data = { config: {}, jobs: [] };
+    saveState(workspace, data);
+    const loaded = loadState(workspace);
+    assert.equal(loaded.workspacePath, workspace);
+  });
+
+  it("loadState on a state file with no workspace path field does not throw", () => {
+    const root = stateRoot(workspace);
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "state.json"),
+      JSON.stringify({ config: { legacy: true }, jobs: [] }),
+      "utf8"
+    );
+    const loaded = loadState(workspace);
+    assert.equal(loaded.workspacePath, undefined);
+    assert.equal(loaded.config.legacy, true);
+  });
+
+  it("createJobRecord sets logFile", () => {
+    const job = createJobRecord(tmpDir, "task", { agent: "build" });
+    assert.ok(job.logFile, "logFile must be set on job record");
+    assert.equal(job.logFile, path.join(stateRoot(tmpDir), "jobs", `${job.id}.log`));
+    const state = loadState(tmpDir);
+    const persisted = state.jobs.find((j) => j.id === job.id);
+    assert.equal(persisted.logFile, job.logFile);
+  });
+
+  it("a job record built for a foreground run carries request", async () => {
+    const request = {
+      taskText: "foreground task",
+      agentName: "build",
+      isWrite: true,
+      resumeSessionId: null,
+      model: "test-model",
+    };
+    const job = createJobRecord(tmpDir, "task", {
+      agent: "build",
+      request,
+    });
+    const stateAtCreation = loadState(tmpDir);
+    const createdJob = stateAtCreation.jobs.find((j) => j.id === job.id);
+    assert.ok(createdJob.logFile, "logFile must be set at creation");
+    assert.deepEqual(createdJob.request, request, "request must be set at creation");
+
+    await runTrackedJob(tmpDir, job, async () => {
+      return { summary: "done" };
+    });
+
+    const stateAfterRun = loadState(tmpDir);
+    const completedJob = stateAfterRun.jobs.find((j) => j.id === job.id);
+    assert.ok(completedJob.logFile, "logFile must be set after completion");
+    assert.deepEqual(completedJob.request, request, "request must be set after completion");
+    assert.equal(completedJob.logFile, job.logFile);
+    assert.ok(fs.existsSync(completedJob.logFile), "logFile must exist on disk");
   });
 
   it("updateState applies mutator", () => {

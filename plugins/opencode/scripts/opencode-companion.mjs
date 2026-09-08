@@ -283,14 +283,48 @@ async function handleAdversarialReview(argv) {
 // ------------------------------------------------------------------
 
 async function handleTask(argv) {
-  const { options, positional } = parseArgs(argv, {
-    valueOptions: ["model", "agent"],
-    booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
-  });
+  let options, positional;
+  try {
+    ({ options, positional } = parseArgs(argv, {
+      valueOptions: ["model", "agent", "task-file"],
+      booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
+      rejectUnknown: true,
+    }));
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
 
-  const taskText = extractTaskText(argv, ["model", "agent"], [
-    "write", "background", "wait", "resume-last", "fresh",
-  ]);
+  const taskFile = options["task-file"];
+  const positionalText = positional.join(" ").trim();
+
+  if (taskFile && positionalText) {
+    console.error("Cannot combine --task-file with positional task text.");
+    process.exit(1);
+  }
+
+  let taskText;
+  if (taskFile) {
+    if (typeof taskFile !== "string" || taskFile === "") {
+      console.error("--task-file requires a file path.");
+      process.exit(1);
+    }
+    const resolvedPath = path.resolve(process.cwd(), taskFile);
+    let content;
+    try {
+      content = fs.readFileSync(resolvedPath, "utf8");
+    } catch (err) {
+      console.error(`Cannot read task file '${taskFile}': ${err.message}`);
+      process.exit(1);
+    }
+    if (!content || content.trim().length === 0) {
+      console.error(`Task file '${taskFile}' is empty.`);
+      process.exit(1);
+    }
+    taskText = content;
+  } else {
+    taskText = positionalText;
+  }
 
   if (!taskText) {
     console.error("No task text provided.");
@@ -316,27 +350,30 @@ async function handleTask(argv) {
     }
   }
 
+  const request = {
+    taskText,
+    agentName,
+    isWrite,
+    resumeSessionId,
+    model: options.model,
+  };
+
   const job = createJobRecord(workspace, "task", {
     agent: agentName,
     resumeSessionId,
+    request,
   });
 
   // Background mode: spawn a detached worker
   if (options.background) {
-    const logFile = jobLogPath(workspace, job.id);
+    const logFile = job.logFile || jobLogPath(workspace, job.id);
     fs.mkdirSync(path.dirname(logFile), { recursive: true });
     upsertJob(workspace, {
       id: job.id,
       status: "queued",
       phase: "queued",
       logFile,
-      request: {
-        taskText,
-        agentName,
-        isWrite,
-        resumeSessionId,
-        model: options.model,
-      },
+      request,
     });
 
     const workerArgs = [

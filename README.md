@@ -143,6 +143,11 @@ The companion now reconciles this automatically:
   state.json and deletes their log and data files. Pass `--keep <n>` to retain
   the n most recent terminal jobs, `--dry-run` to preview, or `--json` for
   structured output.
+- `companion.mjs task` rejects any unrecognised `--flag` instead of folding it
+  into the task text, so a typo fails fast rather than becoming the prompt. Pass
+  `--task-file <path>` to read the task text from a file, which avoids sending a
+  multi-kilobyte brief through a shell argument. It cannot be combined with
+  positional task text.
 
 Each heal check queries `GET /session/:id/message?limit=1`. If the last
 assistant message has `info.finish` set and `info.time.completed >= job.startedAt`,

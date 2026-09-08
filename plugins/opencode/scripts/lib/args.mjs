@@ -14,15 +14,36 @@ export function parseArgs(argv, schema = {}) {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--") {
+      if (positional.length > 0) {
+        positional.push(arg);
+      }
+      for (let j = i + 1; j < argv.length; j++) {
+        positional.push(argv[j]);
+      }
+      break;
+    }
     if (!arg.startsWith("--")) {
       positional.push(arg);
       continue;
     }
-    const key = arg.slice(2);
+    const rawKey = arg.slice(2);
+    const equalsIdx = rawKey.indexOf("=");
+    const key = equalsIdx >= 0 ? rawKey.slice(0, equalsIdx) : rawKey;
+    const inlineVal = equalsIdx >= 0 ? rawKey.slice(equalsIdx + 1) : null;
+
     if (valueSet.has(key)) {
-      options[key] = argv[++i] ?? "";
-    } else if (boolSet.has(key) || !valueSet.has(key)) {
+      options[key] = inlineVal !== null ? inlineVal : (argv[++i] ?? "");
+    } else if (boolSet.has(key)) {
       options[key] = true;
+    } else if (!schema.rejectUnknown) {
+      options[key] = true;
+    } else {
+      const accepted = [...valueSet, ...boolSet].sort().map((k) => `--${k}`).join(", ");
+      const err = new Error(`Unknown option: ${arg}\nAccepted options: ${accepted}`);
+      err.flag = arg;
+      err.accepted = accepted;
+      throw err;
     }
   }
 
@@ -43,15 +64,28 @@ export function extractTaskText(argv, flagsWithValue = [], booleanFlags = []) {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      if (valSet.has(key)) {
-        i++; // skip value
+    if (arg === "--") {
+      if (parts.length > 0) {
+        parts.push(arg);
       }
-      // skip boolean flags silently
+      for (let j = i + 1; j < argv.length; j++) {
+        parts.push(argv[j]);
+      }
+      break;
+    }
+    if (!arg.startsWith("--")) {
+      parts.push(arg);
       continue;
     }
-    parts.push(arg);
+    const rawKey = arg.slice(2);
+    const equalsIdx = rawKey.indexOf("=");
+    const key = equalsIdx >= 0 ? rawKey.slice(0, equalsIdx) : rawKey;
+    if (valSet.has(key)) {
+      if (equalsIdx < 0) {
+        i++; // skip value
+      }
+    }
+    // skip flags silently
   }
 
   return parts.join(" ").trim();

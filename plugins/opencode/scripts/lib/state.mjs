@@ -89,12 +89,15 @@ export function loadState(workspacePath) {
 }
 
 /**
- * Save the state for a workspace.
+ * Save the state for a workspace, stamping workspacePath onto state.
  * @param {string} workspacePath
  * @param {object} state
  */
 export function saveState(workspacePath, state) {
   const root = stateRoot(workspacePath);
+  if (workspacePath) {
+    state.workspacePath = workspacePath;
+  }
   writeJson(stateFile(root), state);
 }
 
