@@ -36,6 +36,7 @@ Command selection:
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`. The dispatch-and-poll loop always uses `--background` at the companion level internally.
 - If the forwarded request includes `--model`, pass it through to `task`.
 - If the forwarded request includes `--agent`, pass it through to `task`.
+- If the forwarded request includes `--backend`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
@@ -47,8 +48,8 @@ Flag handling (since 1.10.0-agy):
   and the accepted list, and exits non-zero. It used to fold an unrecognised flag
   into the prompt and run anyway, so a stripping mistake became the task text and
   spent quota on nothing. That mistake is now a loud failure instead of a silent
-  one. The accepted flags are `--agent`, `--background`, `--fresh`, `--model`,
-  `--resume-last`, `--task-file`, `--wait`, `--write`.
+  one. The accepted flags are `--agent`, `--backend`, `--background`, `--fresh`,
+  `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`.
 - Because of that, put `--` between the flags and the prompt whenever the prompt
   might begin with a dash. A prompt like `"--verbose should be added"` is a single
   argument that starts with `--`, so without the separator it is read as an unknown

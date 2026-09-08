@@ -20,10 +20,11 @@ export const DEFAULT_BACKEND = "opencode";
 /**
  * Resolve the active backend name. Throws on unknown values so a typo
  * fails fast instead of silently running the wrong backend mid-A/B test.
+ * @param {string} [override]
  * @returns {"opencode"|"agy"}
  */
-export function resolveBackendName() {
-  const raw = process.env.OPENCODE_BACKEND ?? DEFAULT_BACKEND;
+export function resolveBackendName(override) {
+  const raw = override ?? process.env.OPENCODE_BACKEND ?? DEFAULT_BACKEND;
   const v = String(raw).trim().toLowerCase();
   if (v === "opencode" || v === "agy") return v;
   throw new Error(
@@ -31,35 +32,52 @@ export function resolveBackendName() {
   );
 }
 
-function impl() {
-  return resolveBackendName() === "agy" ? agy : opencode;
+/**
+ * Validate a backend name from CLI flag or options.
+ * @param {string|undefined} raw
+ * @param {string} [flagName]
+ * @returns {"opencode"|"agy"|undefined}
+ */
+export function validateBackend(raw, flagName = "--backend") {
+  if (raw === undefined || raw === null) return undefined;
+  const v = String(raw).trim().toLowerCase();
+  if (BACKENDS.includes(v)) return v;
+  const expected = BACKENDS.map((b) => JSON.stringify(b)).join(" or ");
+  throw new Error(
+    `Unknown ${flagName}=${JSON.stringify(String(raw))} (expected ${expected})`,
+  );
 }
 
-export async function isServerRunning(...args) {
-  return impl().isServerRunning(...args);
+function impl(backend) {
+  return resolveBackendName(backend) === "agy" ? agy : opencode;
 }
 
-export async function ensureServer(...args) {
-  return impl().ensureServer(...args);
+export async function isServerRunning(opts = {}, ...args) {
+  return impl(opts?.backend).isServerRunning(opts, ...args);
+}
+
+export async function ensureServer(opts = {}, ...args) {
+  return impl(opts?.backend).ensureServer(opts, ...args);
 }
 
 export function createClient(...args) {
-  return impl().createClient(...args);
+  const backend = args[0]?.backend ?? args[1]?.backend;
+  return impl(backend).createClient(...args);
 }
 
-export async function connect(...args) {
-  return impl().connect(...args);
+export async function connect(opts = {}) {
+  return impl(opts?.backend).connect(opts);
 }
 
 /** Backend-aware "is the CLI installed" for setup/doctor output. */
-export async function isBackendInstalled() {
-  if (resolveBackendName() === "agy") return agy.isAgyInstalled();
+export async function isBackendInstalled(backend) {
+  if (resolveBackendName(backend) === "agy") return agy.isAgyInstalled();
   return isOpencodeInstalled();
 }
 
 /** Backend-aware version string for setup/doctor output. */
-export async function getBackendVersion() {
-  if (resolveBackendName() === "agy") return agy.getAgyVersion();
+export async function getBackendVersion(backend) {
+  if (resolveBackendName(backend) === "agy") return agy.getAgyVersion();
   return getOpencodeVersion();
 }
 

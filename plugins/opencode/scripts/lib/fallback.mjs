@@ -132,17 +132,31 @@ export function fallbackBlockedReason(fb) {
  *
  * @param {object} opts
  * @param {string} opts.agent - agent seat name
- * @param {(sel: {agent: string, model?: string}) => Promise<{text: string, value: any}>} opts.attempt
+ * @param {(sel: {agent: string, model?: string, backend?: string}, ctx?: any) => Promise<{text: string, value: any}>} opts.attempt
  * @param {string} [opts.model] - primary model override
+ * @param {string} [opts.backend] - primary backend name (defaults to OPENCODE_BACKEND or "opencode")
+ * @param {(backend: string) => Promise<any>} [opts.connect] - connects and creates session for the given backend
  * @param {(msg: string) => void} [opts.log]
  * @returns {Promise<{value: any, usedFallback: boolean, handoff: object|null}>}
  */
-export async function runWithFallback({ agent, attempt, model, log = () => {} }) {
-  const primary = { agent, model };
+export async function runWithFallback({
+  agent,
+  attempt,
+  model,
+  backend,
+  connect,
+  log = () => {},
+}) {
+  const primaryBackend = backend ?? process.env.OPENCODE_BACKEND ?? "opencode";
+  const primary = { agent, model, backend: primaryBackend };
   let firstError;
 
   try {
-    const res = await attempt(primary);
+    let primaryCtx;
+    if (connect) {
+      primaryCtx = await connect(primaryBackend);
+    }
+    const res = await attempt(primary, primaryCtx);
     if (!isEmptyResult(res?.text)) {
       return { value: res.value, usedFallback: false, handoff: null };
     }
@@ -174,6 +188,9 @@ export async function runWithFallback({ agent, attempt, model, log = () => {} })
     throw firstError;
   }
 
+  const fallbackBackend = fb.backend ?? primaryBackend;
+  const fallbackModel = fb.model ?? (fallbackBackend === primaryBackend ? model : undefined);
+
   const previousBackend = process.env.OPENCODE_BACKEND;
   if (fb.backend) process.env.OPENCODE_BACKEND = fb.backend;
   const previousAgyModel = process.env.AGY_MODEL;
@@ -186,11 +203,18 @@ export async function runWithFallback({ agent, attempt, model, log = () => {} })
   );
 
   try {
-    const res = await attempt({ agent: fb.agent ?? agent, model: fb.backend === "agy" ? undefined : fb.model });
-    if (isEmptyResult(res?.text)) {
-      throw new Error("empty response from the fallback model");
+    let fallbackCtx;
+    if (connect) {
+      fallbackCtx = await connect(fallbackBackend);
     }
-    return { value: res.value, usedFallback: true, handoff: null };
+    const res = await attempt(
+      { agent: fb.agent ?? agent, model: fallbackModel, backend: fallbackBackend },
+      fallbackCtx,
+    );
+    if (!isEmptyResult(res?.text)) {
+      return { value: res.value, usedFallback: true, handoff: null };
+    }
+    throw new Error("empty response from the fallback model");
   } catch (err) {
     // Report the failure the user actually needs to fix: the primary went
     // down, and the backup did not cover for it.
@@ -201,8 +225,8 @@ export async function runWithFallback({ agent, attempt, model, log = () => {} })
     e.cause = err;
     throw e;
   } finally {
-    // The backend is read per call from the environment, so leaving it
-    // switched would silently move every later job onto the fallback.
+    // Restore the environment in case other callers or subprocesses read it,
+    // so leaving it switched does not silently move later work onto the fallback.
     if (previousBackend === undefined) delete process.env.OPENCODE_BACKEND;
     else process.env.OPENCODE_BACKEND = previousBackend;
     if (previousAgyModel === undefined) delete process.env.AGY_MODEL;

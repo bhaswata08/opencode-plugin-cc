@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { parseArgs, extractTaskText } from "../plugins/opencode/scripts/lib/args.mjs";
+import { loadState } from "../plugins/opencode/scripts/lib/state.mjs";
 import { createTmpDir, cleanupTmpDir } from "./helpers.mjs";
 
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -294,5 +295,63 @@ describe("task subcommand integration", () => {
       res.stderr.includes(path.join(workDir, relativeName)),
       `stderr should show path resolved against cwd: ${res.stderr}`
     );
+  });
+
+  it("--backend with unknown value fails fast and names accepted values", () => {
+    const res = runTask(["--backend", "bogus", "say hello"]);
+    assert.notEqual(res.status, 0);
+    assert.ok(
+      res.stderr.includes('Unknown --backend="bogus"') && res.stderr.includes('expected "opencode" or "agy"'),
+      `stderr should name unknown value and expected backends: ${res.stderr}`
+    );
+  });
+
+  it("--backend agy on a --background task reaches the detached worker and beats inherited env var", async () => {
+    const res = runTask(
+      ["--background", "--backend", "agy", "--agent", "coder", "say hello"],
+      {
+        env: { OPENCODE_BACKEND: "opencode" },
+      }
+    );
+    assert.equal(res.status, 0, `task failed: ${res.stderr}`);
+    const state = loadState(workDir);
+    assert.equal(state.jobs.length, 1);
+    const job = state.jobs[0];
+    assert.equal(job.backend, "agy", "job record must persist explicit agy backend");
+
+    const deadline = Date.now() + 5000;
+    let completedJob = null;
+    while (Date.now() < deadline) {
+      const currentState = loadState(workDir);
+      const j = currentState.jobs.find((x) => x.id === job.id);
+      if (j && (j.status === "completed" || j.status === "failed")) {
+        completedJob = j;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(completedJob, "detached worker should complete");
+    assert.equal(completedJob.status, "completed", `worker failed: ${completedJob.errorMessage}`);
+    assert.equal(completedJob.backend, "agy");
+
+    const logContent = fs.readFileSync(job.logFile, "utf8");
+    assert.ok(
+      logContent.includes("connecting to Agy"),
+      `worker log should confirm agy transport was reached: ${logContent}`
+    );
+  });
+
+  it("explicit --backend opencode beats inherited OPENCODE_BACKEND=agy", () => {
+    const res = runTask(
+      ["--background", "--backend", "opencode", "--agent", "coder", "say hello"],
+      {
+        env: { OPENCODE_BACKEND: "agy" },
+      }
+    );
+    assert.equal(res.status, 0, `task failed: ${res.stderr}`);
+    const state = loadState(workDir);
+    const job = state.jobs?.[0];
+    assert.ok(job);
+    assert.equal(job.backend, "opencode", "explicit opencode flag must beat inherited agy");
   });
 });

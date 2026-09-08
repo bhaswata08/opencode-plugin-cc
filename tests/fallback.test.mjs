@@ -140,6 +140,62 @@ test("a transport failure switches backend and model for the retry", async () =>
   assert.equal(seen[1].agyModel, "gemini-3.8-flash-high");
 });
 
+test("a transport failure re-resolves transport and mints fresh session on fallback backend", async () => {
+  const sessions = [];
+  const attempts = [];
+
+  const connect = async (backend) => {
+    const session = { id: `${backend}-ses-${sessions.length + 1}` };
+    sessions.push({ backend, session });
+    return {
+      session,
+      client: {
+        backend,
+        sendPrompt: async (sid, text, opts) => {
+          attempts.push({
+            backend,
+            sessionId: sid,
+            agent: opts?.agent,
+            model: opts?.model,
+          });
+          if (backend === "opencode") {
+            throw new Error("OpenCode API POST /session returned 429: rate limited");
+          }
+          return { text: "ok from agy", value: "ok from agy" };
+        },
+      },
+    };
+  };
+
+  const out = await runWithFallback({
+    agent: "coder",
+    backend: "opencode",
+    connect,
+    attempt: async (sel, ctx) => {
+      const res = await ctx.client.sendPrompt(ctx.session.id, "run task", {
+        agent: sel.agent,
+        model: sel.model,
+      });
+      return { text: res.text, value: res.value };
+    },
+  });
+
+  assert.equal(out.usedFallback, true);
+  assert.equal(sessions.length, 2, "must mint a fresh session for the fallback backend");
+  assert.equal(sessions[0].backend, "opencode");
+  assert.equal(sessions[1].backend, "agy");
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].backend, "opencode");
+  assert.equal(attempts[1].backend, "agy");
+  assert.equal(
+    attempts[1].sessionId,
+    sessions[1].session.id,
+    "retry must run against the freshly minted fallback session, not the primary session",
+  );
+  assert.equal(attempts[1].model, "gemini-3.8-flash-high");
+});
+
+
 test("the environment is restored after a fallback runs", async () => {
   const before = process.env.OPENCODE_BACKEND;
   await runWithFallback({

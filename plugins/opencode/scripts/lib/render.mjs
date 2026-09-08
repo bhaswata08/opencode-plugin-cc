@@ -59,6 +59,10 @@ export function renderResult(job, resultData) {
   lines.push(`- **Status**: ${job.status}`);
   lines.push(`- **Duration**: ${job.elapsed ?? "unknown"}`);
 
+  if (job.backend && job.backend !== "opencode") {
+    lines.push(`- **Backend**: ${job.backend}`);
+  }
+
   if (job.opencodeSessionId) {
     lines.push(`- **OpenCode Session**: ${job.opencodeSessionId}`);
   }

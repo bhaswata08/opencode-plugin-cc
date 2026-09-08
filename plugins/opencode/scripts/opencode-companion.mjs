@@ -10,7 +10,7 @@ import fs from "node:fs";
 
 import { parseArgs, extractTaskText } from "./lib/args.mjs";
 import { spawnDetached } from "./lib/process.mjs";
-import { isServerRunning, ensureServer, createClient, connect, resolveBackendName, effectiveSessionId, isBackendInstalled, getBackendVersion } from "./lib/backend.mjs";
+import { isServerRunning, ensureServer, createClient, connect, resolveBackendName, validateBackend, effectiveSessionId, isBackendInstalled, getBackendVersion } from "./lib/backend.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
@@ -144,13 +144,6 @@ async function handleReview(argv) {
 
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
-
-      report("reviewing", "Creating review session...");
-      const session = await client.createSession({ title: `Code Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
-
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
         adversarial: false,
@@ -159,12 +152,29 @@ async function handleReview(argv) {
       report("reviewing", "Running review...");
       log(`Prompt length: ${prompt.length} chars`);
 
+      let activeClient;
+      let activeSessionId;
+
+      const connectSession = async (backend) => {
+        report("starting", `Connecting to ${backend === "agy" ? "Agy" : "OpenCode"} server...`);
+        const client = await connect({ cwd: workspace, backend });
+        report("reviewing", "Creating review session...");
+        const session = await client.createSession({ title: `Code Review ${job.id}` });
+        upsertJob(workspace, { id: job.id, opencodeSessionId: session.id, backend });
+        activeClient = client;
+        activeSessionId = session.id;
+        return { client, session };
+      };
+
       // The reviewer seat, not agy's bare "plan": this carries the configured
       // review model, and its agent file is read-only the same way plan is.
       const { value, handoff } = await runWithFallback({
         agent: "reviewer",
         log,
-        attempt: async (sel) => {
+        connect: connectSession,
+        attempt: async (sel, ctx) => {
+          const client = ctx?.client ?? activeClient;
+          const session = ctx?.session ?? { id: activeSessionId };
           const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
@@ -172,7 +182,7 @@ async function handleReview(argv) {
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
-          effectiveSessionId(workspace, job.id, session.id, response);
+          activeSessionId = effectiveSessionId(workspace, job.id, session.id, response);
           const t = extractResponseText(response);
           return { text: t, value: { text: t, response } };
         },
@@ -221,13 +231,6 @@ async function handleAdversarialReview(argv) {
 
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
-
-      report("reviewing", "Creating adversarial review session...");
-      const session = await client.createSession({ title: `Adversarial Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
-
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
         adversarial: true,
@@ -237,10 +240,27 @@ async function handleAdversarialReview(argv) {
       report("reviewing", "Running adversarial review...");
       log(`Prompt length: ${prompt.length} chars, focus: ${focus || "(none)"}`);
 
+      let activeClient;
+      let activeSessionId;
+
+      const connectSession = async (backend) => {
+        report("starting", `Connecting to ${backend === "agy" ? "Agy" : "OpenCode"} server...`);
+        const client = await connect({ cwd: workspace, backend });
+        report("reviewing", "Creating adversarial review session...");
+        const session = await client.createSession({ title: `Adversarial Review ${job.id}` });
+        upsertJob(workspace, { id: job.id, opencodeSessionId: session.id, backend });
+        activeClient = client;
+        activeSessionId = session.id;
+        return { client, session };
+      };
+
       const { value, handoff } = await runWithFallback({
         agent: "adversary",
         log,
-        attempt: async (sel) => {
+        connect: connectSession,
+        attempt: async (sel, ctx) => {
+          const client = ctx?.client ?? activeClient;
+          const session = ctx?.session ?? { id: activeSessionId };
           const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
@@ -248,7 +268,7 @@ async function handleAdversarialReview(argv) {
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
-          effectiveSessionId(workspace, job.id, session.id, response);
+          activeSessionId = effectiveSessionId(workspace, job.id, session.id, response);
           const t = extractResponseText(response);
           return { text: t, value: { text: t, response } };
         },
@@ -286,7 +306,7 @@ async function handleTask(argv) {
   let options, positional;
   try {
     ({ options, positional } = parseArgs(argv, {
-      valueOptions: ["model", "agent", "task-file"],
+      valueOptions: ["model", "agent", "task-file", "backend"],
       booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
       rejectUnknown: true,
     }));
@@ -331,6 +351,17 @@ async function handleTask(argv) {
     process.exit(1);
   }
 
+  let explicitBackend;
+  if (options.backend !== undefined) {
+    try {
+      explicitBackend = validateBackend(options.backend, "--backend");
+    } catch (err) {
+      console.error(err.message);
+      process.exit(1);
+    }
+  }
+  const initialBackend = explicitBackend ?? resolveBackendName();
+
   const workspace = await resolveWorkspace();
   const isWrite = options.write !== undefined ? options.write : true;
   const agentName = options.agent ?? (isWrite ? "build" : "plan");
@@ -356,12 +387,14 @@ async function handleTask(argv) {
     isWrite,
     resumeSessionId,
     model: options.model,
+    backend: initialBackend,
   };
 
   const job = createJobRecord(workspace, "task", {
     agent: agentName,
     resumeSessionId,
     request,
+    backend: initialBackend,
   });
 
   // Background mode: spawn a detached worker
@@ -374,6 +407,7 @@ async function handleTask(argv) {
       phase: "queued",
       logFile,
       request,
+      backend: initialBackend,
     });
 
     const workerArgs = [
@@ -387,8 +421,13 @@ async function handleTask(argv) {
     if (isWrite) workerArgs.push("--write");
     if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
     if (options.model) workerArgs.push("--model", options.model);
+    if (explicitBackend) workerArgs.push("--backend", explicitBackend);
 
-    const child = spawnDetached("node", workerArgs, { cwd: workspace, logFile });
+    const child = spawnDetached("node", workerArgs, {
+      cwd: workspace,
+      logFile,
+      env: { OPENCODE_BACKEND: initialBackend },
+    });
     upsertJob(workspace, { id: job.id, pid: child.pid });
     console.log(`OpenCode task started in background: ${job.id}`);
     console.log("Check `/opencode:status` for progress.");
@@ -396,40 +435,54 @@ async function handleTask(argv) {
   }
 
   // Foreground mode
+  if (explicitBackend) {
+    process.env.OPENCODE_BACKEND = explicitBackend;
+  }
+
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
-
-      let sessionId;
-      if (resumeSessionId) {
-        report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
-        sessionId = resumeSessionId;
-      } else {
-        report("starting", "Creating new OpenCode session...");
-        const session = await client.createSession({ title: `Task ${job.id}` });
-        sessionId = session.id;
-      }
-      upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
-
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
 
       report("investigating", "Sending task to OpenCode...");
       log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars`);
 
+      let activeClient;
+      let activeSessionId;
+
+      const connectSession = async (backend) => {
+        report("starting", `Connecting to ${backend === "agy" ? "Agy" : "OpenCode"} server...`);
+        const client = await connect({ cwd: workspace, backend });
+        let session;
+        if (resumeSessionId && backend === initialBackend) {
+          report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
+          session = { id: resumeSessionId };
+        } else {
+          report("starting", "Creating new OpenCode session...");
+          session = await client.createSession({ title: `Task ${job.id}` });
+        }
+        upsertJob(workspace, { id: job.id, opencodeSessionId: session.id, backend });
+        activeClient = client;
+        activeSessionId = session.id;
+        return { client, session };
+      };
+
       const { value, usedFallback, handoff } = await runWithFallback({
         agent: agentName,
         model: options.model,
+        backend: initialBackend,
         log,
-        attempt: async (sel) => {
-          const response = await client.sendPrompt(sessionId, prompt, {
+        connect: connectSession,
+        attempt: async (sel, ctx) => {
+          const client = ctx?.client ?? activeClient;
+          const session = ctx?.session ?? { id: activeSessionId };
+          const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
             onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
-          sessionId = effectiveSessionId(workspace, job.id, sessionId, response);
+          activeSessionId = effectiveSessionId(workspace, job.id, session.id, response);
           const t = extractResponseText(response);
           return { text: t, value: { text: t, response } };
         },
@@ -450,9 +503,9 @@ async function handleTask(argv) {
 
       // Get changed files if write mode
       let changedFiles = [];
-      if (isWrite) {
+      if (isWrite && activeClient) {
         try {
-          const diff = await client.getSessionDiff(sessionId);
+          const diff = await activeClient.getSessionDiff(activeSessionId);
           if (diff?.files) {
             changedFiles = diff.files.map((f) => f.path || f.name).filter(Boolean);
           }
@@ -478,7 +531,7 @@ async function handleTask(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseArgs(argv, {
-    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session"],
+    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session", "backend"],
     booleanOptions: ["write"],
   });
 
@@ -493,38 +546,59 @@ async function handleTaskWorker(argv) {
     process.exit(1);
   }
 
+  let explicitBackend;
+  if (options.backend !== undefined) {
+    try {
+      explicitBackend = validateBackend(options.backend, "--backend");
+      process.env.OPENCODE_BACKEND = explicitBackend;
+    } catch {
+      process.exit(1);
+    }
+  }
+  const initialBackend = explicitBackend ?? resolveBackendName();
+
   try {
-    await runTrackedJob(workspace, { id: jobId }, async ({ report, log }) => {
-      report("starting", "Background worker connecting to OpenCode...");
-      const client = await connect({ cwd: workspace });
-
-      let sessionId;
-      if (resumeSessionId) {
-        sessionId = resumeSessionId;
-        report("starting", `Resuming session ${resumeSessionId}...`);
-      } else {
-        const session = await client.createSession({ title: `Task ${jobId}` });
-        sessionId = session.id;
-        report("starting", `Created session ${sessionId}`);
-      }
-      upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
-
+    await runTrackedJob(workspace, { id: jobId, backend: initialBackend }, async ({ report, log }) => {
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
       report("investigating", "Running task...");
+
+      let activeClient;
+      let activeSessionId;
+
+      const connectSession = async (backend) => {
+        report("starting", `Background worker connecting to ${backend === "agy" ? "Agy" : "OpenCode"}...`);
+        const client = await connect({ cwd: workspace, backend });
+        let session;
+        if (resumeSessionId && backend === initialBackend) {
+          session = { id: resumeSessionId };
+          report("starting", `Resuming session ${resumeSessionId}...`);
+        } else {
+          session = await client.createSession({ title: `Task ${jobId}` });
+          report("starting", `Created session ${session.id}`);
+        }
+        upsertJob(workspace, { id: jobId, opencodeSessionId: session.id, backend });
+        activeClient = client;
+        activeSessionId = session.id;
+        return { client, session };
+      };
 
       const { value, usedFallback, handoff } = await runWithFallback({
         agent: agentName,
         model: options.model,
+        backend: initialBackend,
         log,
-        attempt: async (sel) => {
-          const response = await client.sendPrompt(sessionId, prompt, {
+        connect: connectSession,
+        attempt: async (sel, ctx) => {
+          const client = ctx?.client ?? activeClient;
+          const session = ctx?.session ?? { id: activeSessionId };
+          const response = await client.sendPrompt(session.id, prompt, {
             agent: sel.agent,
             model: sel.model,
             onProgress: (line) => log(line),
           });
           // Agy backend: learn the real conversation_id (createSession is a
           // no-op there). No-op for opencode.
-          sessionId = effectiveSessionId(workspace, jobId, sessionId, response);
+          activeSessionId = effectiveSessionId(workspace, jobId, session.id, response);
           const text = extractResponseText(response);
           return { text, value: text };
         },

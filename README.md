@@ -145,9 +145,10 @@ The companion now reconciles this automatically:
   structured output.
 - `companion.mjs task` rejects any unrecognised `--flag` instead of folding it
   into the task text, so a typo fails fast rather than becoming the prompt. Pass
-  `--task-file <path>` to read the task text from a file, which avoids sending a
-  multi-kilobyte brief through a shell argument. It cannot be combined with
-  positional task text.
+  `--backend <opencode|agy>` to select the transport explicitly (defaults to
+  `OPENCODE_BACKEND` or `opencode`). Pass `--task-file <path>` to read the task
+  text from a file, which avoids sending a multi-kilobyte brief through a shell
+  argument. It cannot be combined with positional task text.
 
 Each heal check queries `GET /session/:id/message?limit=1`. If the last
 assistant message has `info.finish` set and `info.time.completed >= job.startedAt`,
@@ -163,6 +164,8 @@ comes back.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `OPENCODE_BACKEND` | `opencode` | Active transport: `opencode` (default) or `agy` |
+| `AGY_MODEL` | (unset) | Default agy model override (per-call `--model` wins) |
 | `OPENCODE_REQUEST_TIMEOUT_MS` | `1800000` | Per-HTTP-request abort timeout |
 | `OPENCODE_PROMPT_TIMEOUT_MS` | `14400000` | `sendPrompt` absolute cap (races the 5-min server body-close) |
 | `OPENCODE_IDLE_TIMEOUT_MS` | `900000` | Session idle watchdog — no activity for this long → abort |

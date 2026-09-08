@@ -62,6 +62,7 @@ Command selection:
 - If the forwarded request includes `--model`, pass it through to `task`.
 - Pass `--agent coder` unless the forwarded request names a different one. Without it the companion falls back to opencode's built-in `build` agent, which ignores the user's configured coder seat and its model.
 - If the forwarded request includes `--agent`, pass that through instead.
+- If the forwarded request includes `--backend`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
@@ -70,11 +71,11 @@ Command selection:
 Flag handling (since 1.10.0-agy):
 
 - `task` rejects any `--flag` it does not declare and exits non-zero, naming the
-  flag and listing what it accepts: `--agent`, `--background`, `--fresh`,
-  `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`. It used to fold
-  an unrecognised flag into the prompt and run anyway, so a stripping mistake
-  silently became the task text and spent quota on nothing. Getting the stripping
-  wrong now fails the dispatch outright, which you report as
+  flag and listing what it accepts: `--agent`, `--backend`, `--background`,
+  `--fresh`, `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`. It
+  used to fold an unrecognised flag into the prompt and run anyway, so a stripping
+  mistake silently became the task text and spent quota on nothing. Getting the
+  stripping wrong now fails the dispatch outright, which you report as
   `ERROR: companion dispatch failed (<reason>)`.
 - The `--` in the dispatch command above is not decoration. The prompt is
   forwarded verbatim and may begin with a dash, and a prompt such as

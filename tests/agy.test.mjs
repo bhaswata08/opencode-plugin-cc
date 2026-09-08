@@ -39,8 +39,10 @@ import {
 } from "../plugins/opencode/scripts/lib/agy-runner.mjs";
 import {
   resolveBackendName,
+  validateBackend,
   effectiveSessionId,
   createClient as backendCreateClient,
+  connect as backendConnect,
 } from "../plugins/opencode/scripts/lib/backend.mjs";
 import { createClient as opencodeCreateClient } from "../plugins/opencode/scripts/lib/opencode-server.mjs";
 import { autoHealAgyJob } from "../plugins/opencode/scripts/lib/auto-heal.mjs";
@@ -398,6 +400,21 @@ describe("backend selection", () => {
     const ocClient = backendCreateClient("http://127.0.0.1:4096");
     assert.equal(typeof ocClient.sendPrompt, "function");
     assert.equal(ocClient.backend, undefined);
+  });
+
+  it("validates backend names and throws on invalid values", () => {
+    assert.equal(validateBackend("agy"), "agy");
+    assert.equal(validateBackend("OPENCODE"), "opencode");
+    assert.equal(validateBackend(undefined), undefined);
+    assert.throws(
+      () => validateBackend("unknown", "--backend"),
+      /Unknown --backend="unknown" \(expected "opencode" or "agy"\)/,
+    );
+  });
+
+  it("connect dispatches per explicit backend option", async () => {
+    const agyConn = await backendConnect({ cwd: "/tmp", backend: "agy" });
+    assert.equal(agyConn.backend, "agy");
   });
 });
 
