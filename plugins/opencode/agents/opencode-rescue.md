@@ -32,7 +32,7 @@ Use the **2-step wait-and-result loop** for every request by default. It is the 
 1. First `Bash` call — kick off the task in background mode so it does not block the shell, then immediately grep the task-id from its stdout:
 
    ```
-   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write --agent coder "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write --agent coder -- "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
      grep -oE 'task-[a-z0-9]{6,}-[a-z0-9]{4,}' /tmp/_oc_task_out | head -1
    ```
 
@@ -66,6 +66,24 @@ Command selection:
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
+
+Flag handling (since 1.10.0-agy):
+
+- `task` rejects any `--flag` it does not declare and exits non-zero, naming the
+  flag and listing what it accepts: `--agent`, `--background`, `--fresh`,
+  `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`. It used to fold
+  an unrecognised flag into the prompt and run anyway, so a stripping mistake
+  silently became the task text and spent quota on nothing. Getting the stripping
+  wrong now fails the dispatch outright, which you report as
+  `ERROR: companion dispatch failed (<reason>)`.
+- The `--` in the dispatch command above is not decoration. The prompt is
+  forwarded verbatim and may begin with a dash, and a prompt such as
+  `"--verbose should be added"` is one argument starting with `--`, which without
+  the separator is read as an unknown flag and rejected. Keep `--` immediately
+  before the prompt on every dispatch, with all routing flags before it.
+- For a prompt too long or too quote-heavy to pass safely as a shell argument,
+  write it to a file and use `--task-file <path>` in place of the positional
+  text. Do not pass both; that is an error.
 
 Safety rules:
 

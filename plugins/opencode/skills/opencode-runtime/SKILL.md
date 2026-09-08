@@ -41,6 +41,23 @@ Command selection:
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 
+Flag handling (since 1.10.0-agy):
+
+- `task` rejects any `--flag` it does not declare, printing the offending flag
+  and the accepted list, and exits non-zero. It used to fold an unrecognised flag
+  into the prompt and run anyway, so a stripping mistake became the task text and
+  spent quota on nothing. That mistake is now a loud failure instead of a silent
+  one. The accepted flags are `--agent`, `--background`, `--fresh`, `--model`,
+  `--resume-last`, `--task-file`, `--wait`, `--write`.
+- Because of that, put `--` between the flags and the prompt whenever the prompt
+  might begin with a dash. A prompt like `"--verbose should be added"` is a single
+  argument that starts with `--`, so without the separator it is read as an unknown
+  flag and the dispatch fails. Everything after `--` is prompt text.
+- For a prompt long enough to be awkward as a shell argument, write it to a file
+  and pass `--task-file <path>`. The companion reads it as UTF-8 and treats it
+  exactly as typed text. It cannot be combined with positional prompt text, and it
+  errors on a missing, unreadable or empty file.
+
 Safety rules:
 
 - Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
