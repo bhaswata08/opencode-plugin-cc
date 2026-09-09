@@ -70,11 +70,14 @@ const OPENCODE_MARKERS = [
   /opencode-companion\.mjs/,
   /opencode:opencode-rescue/,
   /opencode rescue/i,
-  /task-[a-z0-9]{6,}-[a-z0-9]{4,}/,
 ];
 
 // Companion task ids look like `task-moNNNNNN-NNNNNN`.
-const TASK_ID_RE = /\btask-[a-z0-9]{6,}-[a-z0-9]{4,}\b/g;
+// Note: ids are still extracted from free text on purpose here, because this hook
+// fires when the rescue subagent returns placeholder text instead of a rendered result
+// block. Requiring a '## Job:' or dispatch-line anchor would find zero ids in the
+// exact case this hook exists to catch.
+const TASK_ID_RE = /\btask-[a-z0-9]{8,9}-[a-z0-9]{1,6}\b/g;
 
 function resolveCompanionPath() {
   const here = fileURLToPath(import.meta.url);
@@ -84,7 +87,7 @@ function resolveCompanionPath() {
 function buildReminder(taskIds, companionPath) {
   const idLine = taskIds.length
     ? `Likely task id(s) seen in response: ${taskIds.join(", ")}.`
-    : "No task id was visible in the vague response — check most recent companion job with `node \"" + companionPath + "\" list` style introspection (or `ls -t /Users/harvest/.claude/plugins/data/opencode-tasict-*/state/*/jobs/*.log | head -3`).";
+    : "No task id was visible in the vague response — check most recent companion job with `node \"" + companionPath + "\" status` or list subcommands.";
   return [
     "<opencode-vague-notification-detected>",
     "The rescue subagent you just dispatched returned a placeholder string instead of the companion's rendered terminal report. Do NOT treat this as a completed task.",
