@@ -71,6 +71,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { getChangedFiles, getUntrackedFiles } from "./git.mjs";
+// Progress-line formatters live in the shared progress.mjs so the opencode
+// transport emits the same line shapes. Re-exported here so existing
+// importers keep working without edits.
+import { formatToolDetail, formatProgressEvent } from "./progress.mjs";
+
+export { formatToolDetail, formatProgressEvent };
 
 // ---------------------------------------------------------------------------
 // Env conventions (mirror the OPENCODE_*_TIMEOUT_MS pattern)
@@ -356,91 +362,6 @@ export function parseModelsOutput(stdout) {
     out.push({ id, name });
   }
   return out;
-}
-
-/**
- * Format a tool call parameter summary into a readable string.
- * @param {string} toolName
- * @param {object} [params]
- * @returns {string}
- */
-export function formatToolDetail(toolName, params) {
-  if (!params || typeof params !== "object") return "";
-  const raw = params.CommandLine
-    || params.TargetFile
-    || params.AbsolutePath
-    || params.DirectoryPath
-    || params.Pattern
-    || params.Query
-    || params.query
-    || params.Url
-    || params.Prompt
-    || params.Action
-    || (typeof Object.values(params)[0] === "string" ? Object.values(params)[0] : "");
-  const detail = String(raw).trim();
-  if (!detail) return "";
-  return detail.length > 120 ? `${detail.slice(0, 117)}...` : detail;
-}
-
-/**
- * Format an NDJSON stream event from agy into a human-readable log line.
- * Returns null for uninteresting or redundant events (such as intermediate deltas).
- *
- * @param {object} evt - parsed NDJSON event object
- * @param {Set<number>} [seenSteps] - track step indices to avoid duplicate lines
- * @returns {string|null}
- */
-export function formatProgressEvent(evt, seenSteps = new Set()) {
-  if (!evt || typeof evt !== "object") return null;
-
-  if (evt.event === "init") {
-    const cid = evt.conversation_id || evt.init?.conversation_id;
-    return cid ? `session started (${cid})` : "session started";
-  }
-
-  if (evt.event === "step_update" && evt.step_update) {
-    const su = evt.step_update;
-    const stepType = su.step_type;
-    const state = su.state;
-    const stepIndex = su.step_index;
-
-    if (stepType === "tool") {
-      const toolName = su.tool_name || su.tool_info?.name || "tool";
-      if (state === "ACTIVE") {
-        const detail = formatToolDetail(toolName, su.tool_info?.parameters);
-        return detail ? `tool: ${toolName} (${detail})` : `tool: ${toolName}`;
-      }
-      if (state === "DONE") {
-        const dur = typeof su.duration_seconds === "number"
-          ? ` (${su.duration_seconds.toFixed(2)}s)`
-          : "";
-        return `tool: ${toolName} completed${dur}`;
-      }
-      if (state === "ERROR") {
-        const errMsg = su.tool_info?.error?.message || "unknown error";
-        return `tool: ${toolName} failed: ${errMsg}`;
-      }
-    }
-
-    if (stepType === "agent_response") {
-      if (state === "ACTIVE") {
-        if (!seenSteps.has(stepIndex)) {
-          seenSteps.add(stepIndex);
-          return "agent responding";
-        }
-      } else if (state === "DONE") {
-        if (!seenSteps.has(stepIndex)) {
-          seenSteps.add(stepIndex);
-          const dur = typeof su.duration_seconds === "number"
-            ? ` (${su.duration_seconds.toFixed(2)}s)`
-            : "";
-          return `agent thinking completed${dur}`;
-        }
-      }
-    }
-  }
-
-  return null;
 }
 
 /**

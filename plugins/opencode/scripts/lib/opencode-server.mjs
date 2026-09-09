@@ -13,6 +13,7 @@ import os from "node:os";
 export { probeSessionTerminal } from "./auto-heal.mjs";
 import { ensureOpencodeConfig } from "./opencode-config.mjs";
 import { classifyError } from "./errors.mjs";
+import { createProgressEmitter } from "./progress.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
 const DEFAULT_PORT = 4096;
@@ -321,6 +322,9 @@ export function createClient(baseUrl, opts = {}) {
   const headers = {
     "Content-Type": "application/json",
   };
+  // Workspace root for this client (also sent as x-opencode-directory).
+  // Captured here because sendPrompt's own `opts` shadows the client options.
+  const clientDirectory = opts.directory;
   if (opts.directory) {
     headers["x-opencode-directory"] = opts.directory;
   }
@@ -407,6 +411,28 @@ export function createClient(baseUrl, opts = {}) {
       const ac = new AbortController();
       const timeoutId = setTimeout(() => ac.abort(new Error("prompt timeout")), PROMPT_TIMEOUT_MS);
       const startedAt = Date.now();
+      // Progress reporting: the poll loop below already walks every message's
+      // parts each cycle, so forward tool/patch activity to the caller's
+      // onProgress (wired to the job log by handleTask/handleTaskWorker).
+      // Appending log lines needs no state write and takes no lock.
+      // The client-level directory is the workspace root: patch file lists
+      // render workspace-relative against it (basename fallback otherwise).
+      const onProgress = opts.onProgress ?? opts.log;
+      const progress = createProgressEmitter(onProgress, { root: clientDirectory });
+      const emitMessageParts = (msg) => {
+        if (!msg || typeof msg !== "object") return;
+        const msgParts = Array.isArray(msg.parts) ? msg.parts : [];
+        if (msgParts.length === 0) return;
+        // Skip stale pre-prompt messages: the first polls can still see the
+        // previous turn as latest until the new generation starts. Only parts
+        // from messages created after this prompt began count as progress.
+        const msgInfo = msg.info ?? null;
+        const msgCreated = typeof msgInfo?.time?.created === "number"
+          ? msgInfo.time.created
+          : (typeof msg.time?.created === "number" ? msg.time.created : 0);
+        if (msgCreated && msgCreated < startedAt) return;
+        progress.emitParts(msgParts);
+      };
       // Grace period so we don't mistake "session had no prior activity" for
       // completion before the new prompt has even begun generating.
       const MIN_POLL_DELAY_MS = process.env.OPENCODE_MIN_POLL_DELAY_MS !== undefined
@@ -473,6 +499,11 @@ export function createClient(baseUrl, opts = {}) {
               for (let i = parts.length - 1; i >= 0; i--) {
                 if (parts[i]?.type === "tool") { lastTool = parts[i]; break; }
               }
+
+              // Forward tool/patch activity to onProgress. The emitter dedups
+              // on part.id (+ status class), so re-polls are silent; this is
+              // a log append only and never touches job state / updatedAt.
+              emitMessageParts(last);
 
               // Activity signature: any change here = progress was made.
               const sig = JSON.stringify({
@@ -621,6 +652,11 @@ export function createClient(baseUrl, opts = {}) {
           ac.abort();
           fetchPromise.catch(() => {});
           watcherPromise.catch(() => {});
+          // The fetch path can win before the watcher polled (fast jobs):
+          // walk the winning message through the same deduped emitter so its
+          // tool lines still reach the log. No-op when the watcher already
+          // emitted them.
+          emitMessageParts(first.data);
           return first.data;
         }
         // First to settle was a failure — the other promise may still succeed.
@@ -631,7 +667,10 @@ export function createClient(baseUrl, opts = {}) {
         ac.abort();
         fetchPromise.catch(() => {});
         watcherPromise.catch(() => {});
-        if (second.ok) return second.data;
+        if (second.ok) {
+          emitMessageParts(second.data);
+          return second.data;
+        }
         // Both failed - surface the more informative error.
         // If the abort controller was triggered with an explicit reason (quota,
         // idle timeout, prompt timeout, bash stuck), prefer that over a generic
