@@ -33,7 +33,7 @@ Use the **2-step wait-and-result loop** for every request by default. It is the 
 
    ```
    node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write --agent coder -- "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
-     grep -oE 'task-[a-z0-9]{6,}-[a-z0-9]{4,}' /tmp/_oc_task_out | head -1
+     grep -oE 'task-[a-z0-9]{8,9}-[a-z0-9]{1,6}' /tmp/_oc_task_out | head -1
    ```
 
    (Include `--resume-last` instead of `--fresh` when the user said `--resume` — see Command selection below.)
