@@ -26,17 +26,79 @@ function readHookInput() {
   }
 }
 
-// Companion task ids look like `task-moNNNNNN-NNNNNN`.
-const TASK_ID_RE = /\btask-[a-z0-9]{6,}-[a-z0-9]{4,}\b/g;
+// Companion task ids come from generateJobId in lib/state.mjs:
+//   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+// so a genuine id is `task-` + timestamp part + random part, e.g.
+// `task-mo3k1x2p-a7f9qs`. This was once matched with open-ended quantifiers
+// (`{6,}`/`{4,}`), which also matched ordinary words — e.g. the companion's
+// own `"task-resume-candidate"` subcommand key (`resume` + `candidate`)
+// false-positived on a plain read of the plugin source. The quantifiers
+// below are pinned to the generator's real output:
+// - timestamp: Date.now().toString(36) is 8 chars from 1972-06-25 (36^7 ms)
+//   until 2059-05-25 (36^8 ms), then 9 chars. {8,9} keeps matching across
+//   that rollover.
+// - random: slice(2, 8) of a base-36 float is 6 chars in practice, but a
+//   short exact expansion (e.g. (0.5).toString(36) === "0.i") can yield
+//   fewer, so {1,6} tolerates a freak short id instead of silently dropping
+//   a real job.
+const TASK_ID = "task-[a-z0-9]{8,9}-[a-z0-9]{1,6}";
 
-// Only react to responses that are unambiguously from the opencode companion,
-// to avoid false positives on arbitrary text containing a task-like token.
-const OPENCODE_MARKERS = [
-  /OpenCode task started/i,
-  /opencode-companion\.mjs/,
-  /opencode:opencode-rescue/,
-  /opencode rescue/i,
-];
+// Ids are extracted ONLY from the two lines the companion actually emits to
+// announce/report a job — never from free text. This anchoring (not the id
+// shape above) is the primary guard: a well-formed id mentioned in prose —
+// e.g. an example id quoted in a dispatch prompt — is indistinguishable from
+// one that was really dispatched, so no shape check alone can reject it. The
+// tight quantifiers are defence in depth; the anchors do the real work:
+// - background dispatch (Bash path: the orchestrator calls the companion
+//   directly), from opencode-companion.mjs:
+//     `OpenCode task started in background: <id>`
+// - rendered result header (Agent path: the dispatch happens inside the
+//   opencode-rescue subagent's own Bash calls, which the main thread never
+//   sees — the subagent's returned text carries the `## Job: <id>` header
+//   from renderResult in lib/render.mjs). Both anchors are required; the
+//   dispatch line alone would break the Agent matcher entirely.
+// NOTE: renderStatus (`companion status`) emits neither line — its ids sit
+// in `- **<id>**` bullets — so status output can never re-arm a Monitor.
+// The old OPENCODE_MARKERS pre-check (substring markers like the companion
+// filename) is gone: both anchors above are line-pinned to
+// companion-emitted formats, and the markers proved unable to distinguish
+// "reading the plugin" from "using the plugin", so they were dead weight.
+const DISPATCH_RE = new RegExp(`^.*OpenCode task started in background:\\s*(${TASK_ID})\\s*$`, "gm");
+const JOB_HEADER_RE = new RegExp(`^## Job:\\s*(${TASK_ID})\\s*$`, "gm");
+
+// Terminal states mirror both the monitor loop's `case` in
+// buildMonitorScript below and handleWaitAndResult's terminalStatuses in
+// opencode-companion.mjs.
+const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+
+export function extractTaskIds(text) {
+  if (!text) return [];
+  const ids = [];
+  const seen = new Set();
+  const add = (id) => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  };
+  // Fresh dispatches are always worth monitoring.
+  for (const m of text.matchAll(DISPATCH_RE)) add(m[1]);
+  // Rendered result blocks: skip blocks whose own `- **Status**:` line says
+  // the job is already terminal — re-arming a Monitor there would only
+  // re-report a result the thread already holds (the first poll would see
+  // the terminal state and exit). Fail open when no status line is
+  // parseable, so the Agent path can never silently stop monitoring a live
+  // job.
+  for (const m of text.matchAll(JOB_HEADER_RE)) {
+    const id = m[1];
+    if (seen.has(id)) continue;
+    const after = text.slice(m.index + m[0].length, m.index + m[0].length + 500);
+    const st = after.match(/^[ \t]*-[ \t]*\*\*Status\*\*:[ \t]*([A-Za-z]+)/m);
+    if (st && TERMINAL_STATES.has(st[1].toLowerCase())) continue;
+    add(id);
+  }
+  return ids;
+}
 
 function extractResponseText(response) {
   if (response == null) return "";
@@ -180,9 +242,8 @@ function main() {
 
   const response = extractResponseText(input.tool_response);
   if (!response) return;
-  if (!OPENCODE_MARKERS.some((r) => r.test(response))) return;
 
-  const ids = [...new Set(response.match(TASK_ID_RE) || [])];
+  const ids = extractTaskIds(response);
   if (ids.length === 0) return;
 
   const companionPath = resolveCompanionPath();
