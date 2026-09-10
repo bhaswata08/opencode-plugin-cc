@@ -29,7 +29,10 @@ export const FALLBACKS = {
   // through agy runs on an account that is paid for, so it is the seat that
   // survives the free tier going away.
   coder: { backend: "agy", model: "gemini-3.8-flash-high" },
-  // "build" is the default agent for write tasks and means the same seat.
+  // "build" is opencode's built-in write agent, not the coder seat: it carries
+  // none of coder.md's model, variant, temperature, or system prompt. It is mapped
+  // here only so a dispatch that reached build anyway still falls back somewhere
+  // sane. Do not treat build and coder as interchangeable.
   build: { backend: "agy", model: "gemini-3.8-flash-high" },
 
   reviewer: { handoff: "claude-subagent", model: "sonnet" },

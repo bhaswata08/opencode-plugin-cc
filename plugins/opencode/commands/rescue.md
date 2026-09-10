@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the OpenCode rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <provider/model>] [--agent <build|plan>] [--backend <opencode|agy>] [what OpenCode should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--model <provider/model>] [--agent <coder|reviewer|adversary>] [--backend <opencode|agy>] [what OpenCode should investigate, solve, or continue]"
 context: fork
 allowed-tools: Bash(node:*)
 ---
@@ -38,11 +38,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task-resume-candidat
 
 Operating rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task ...` and return that command's stdout as-is.
+- The subagent is a thin forwarder only. It dispatches one background `task` call, then polls with `wait-and-result` and returns that call's stdout as-is.
 - Return the OpenCode companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/opencode:status`, fetch `/opencode:result`, call `/opencode:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--agent` unset unless the user explicitly asks for a specific agent (build or plan).
+- Leave `--agent` unset unless the user explicitly asks for a specific seat (reviewer or adversary). The rescue subagent injects `coder` when unset. Never pass `build` or `plan`, which are opencode's built-ins and carry none of a configured seat's model, variant, temperature, or system prompt.
 - Leave the model unset unless the user explicitly asks for one.
 - Leave `--backend` unset unless the user explicitly asks for a specific backend (opencode or agy).
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.

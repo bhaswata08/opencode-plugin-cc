@@ -18,9 +18,12 @@ A good OpenCode task prompt should:
 
 ## Agent Selection
 
-OpenCode has two primary agents:
-- **build** (default): Full read/write access, can execute commands, edit files, and make changes
-- **plan**: Read-only analysis mode, good for investigation and architecture planning
+Rescue dispatches go through named seats configured at the user level, each with its own pinned model, variant, temperature, and system prompt:
+- **coder** (default): full read/write access, edits files, runs commands
+- **reviewer**: read-only, reviews a diff and reports findings
+- **adversary**: read-only, reviews a plan or design and reports holes
+
+opencode's built-in **build** and **plan** agents are not these seats and carry none of their configuration. Never route a rescue dispatch to either of them.
 
 ## Best Practices
 

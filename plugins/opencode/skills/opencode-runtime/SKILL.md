@@ -13,26 +13,28 @@ Primary helper:
 
 Default dispatch pattern — **dispatch-and-poll loop**:
 
-1. `task --background --write "<prompt>"` → capture task-id (grep from stdout).
-2. Multiple `status <task-id> --json` polls (each a short Bash call, `sleep 30 && node ... status`).
-3. Once `status` is terminal (`completed` / `failed` / `cancelled`), final `result <task-id>` → return that stdout unchanged.
+1. `task --background --write --agent coder -- "<prompt>"` → capture task-id (grep from stdout).
+2. `wait-and-result <task-id> --max-wait 480` with the Bash `timeout` parameter set to `600000`. One call watches for up to 8 minutes and returns a real exit code.
+3. Exit 2 means still running: call `wait-and-result` again. Exit 0 means the output already contains the rendered result; return it unchanged. Never `sleep` and poll `status` by hand.
 
-Do not use `tail -f` on the companion log file as a substitute for polling. The Bash tool caps at 10 minutes per call and the tail approach produces a vague fallback string when the task runs longer. The status-poll loop uses multiple short Bash calls that each fit well under the cap.
+Do not use `tail -f` on the companion log file as a substitute for polling. The Bash tool caps at 10 minutes per call and the tail approach produces a vague fallback string when the task runs longer. Use `wait-and-result`, which watches internally and returns once per call.
+
+Bash foreground limit: the Bash tool waits in the foreground for 120 seconds by default, then moves a still-running command to the background and returns a background ID instead of an exit code. Any companion call that may run longer must set the Bash `timeout` parameter, up to 600000 (10 minutes), so it stays in the foreground long enough to return a real exit code. The rescue poll pairs `--max-wait 480` with `timeout: 600000`, which leaves 2 minutes of headroom under the ceiling.
 
 Execution rules:
 
-- The rescue subagent is a forwarder, not an orchestrator. Its only work is the dispatch-and-poll loop plus returning the final `result` stdout.
+- The rescue subagent is a forwarder, not an orchestrator. Its only work is the dispatch-and-poll loop plus returning the `wait-and-result` stdout.
 - Prefer the helper over hand-rolled `git`, direct OpenCode CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from the subagent. `status` and `result` are permitted only as part of the poll loop.
+- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from the subagent. `wait-and-result` is the only permitted follow-up command; do not call `status` or `result` directly.
 - Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.
-- You may use the `opencode-prompting` skill to rewrite the user's request into a tighter OpenCode prompt before the `task` call.
-- That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
-- Leave `--agent` unset unless the user explicitly requests a specific agent (build or plan).
+- Forward the user's task text as-is apart from stripping routing flags. Shaping the prompt is the job of the parent that wrote the request, not of the forwarder.
+- No Claude-side work is allowed beyond the dispatch-and-poll loop. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
+- Always pass `--agent`. Default to `--agent coder` unless the forwarded request names a different seat. Leaving it unset makes the companion fall back to opencode's built-in `build` agent, which is not one of the user's configured seats and carries none of its pinned model, variant, temperature, or system prompt.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 
 Command selection:
 
-- Use exactly one `task` invocation per rescue handoff. Follow it with status polls and one final `result` call.
+- Use exactly one `task` invocation per rescue handoff. Follow it with `wait-and-result` calls until one returns exit 0; the result is in that call's stdout, so no separate `result` call is needed.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`. The dispatch-and-poll loop always uses `--background` at the companion level internally.
 - If the forwarded request includes `--model`, pass it through to `task`.
 - If the forwarded request includes `--agent`, pass it through to `task`.
@@ -50,10 +52,12 @@ Flag handling (since 1.10.0-agy):
   spent quota on nothing. That mistake is now a loud failure instead of a silent
   one. The accepted flags are `--agent`, `--backend`, `--background`, `--fresh`,
   `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`.
-- Because of that, put `--` between the flags and the prompt whenever the prompt
-  might begin with a dash. A prompt like `"--verbose should be added"` is a single
-  argument that starts with `--`, so without the separator it is read as an unknown
-  flag and the dispatch fails. Everything after `--` is prompt text.
+- Because of that, always put `--` between the flags and the prompt, on every
+  dispatch, not only when the prompt might begin with a dash. Judging whether it
+  might is one extra thing to get wrong, and a prompt like
+  `"--verbose should be added"` is a single argument that starts with `--`, so
+  without the separator it is read as an unknown flag and the dispatch fails.
+  Everything after `--` is prompt text.
 - For a prompt long enough to be awkward as a shell argument, write it to a file
   and pass `--task-file <path>`. The companion reads it as UTF-8 and treats it
   exactly as typed text. It cannot be combined with positional prompt text, and it
@@ -64,5 +68,5 @@ Safety rules:
 - Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, fetch results outside the dispatch-and-poll loop, cancel jobs, summarize output, or do any follow-up work of your own.
-- Return the stdout of the final `result` command exactly as-is.
+- Return the stdout of the successful `wait-and-result` command exactly as-is.
 - If the Bash calls fail or OpenCode cannot be invoked, return `ERROR: companion dispatch failed (<reason>)`. Never return placeholder strings like "Monitor started" or "Waiting for completion" — they are failure modes, not results.

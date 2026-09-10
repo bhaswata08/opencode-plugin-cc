@@ -6,6 +6,8 @@ user-invocable: false
 
 # OpenCode Result Handling
 
+These layers are for the parent presenting results and not for the forwarder.
+
 ## Result Structure
 
 OpenCode returns results as structured session data containing:
@@ -74,9 +76,9 @@ for m in msgs[-10:]:
 '
 ```
 
-### Layer 3: Bash wrapper output (when subagent tails companion --wait)
+### Layer 3: Bash wrapper output (parent fallback only)
 
-When the rescue subagent runs `companion task --wait` via Bash `run_in_background=true`, the subagent's Bash tool emits a local_bash task-id (e.g. `buzkqvlq7`). Use `TaskOutput(task_id=<bash-id>, block=false)` to see the raw tail of the companion's stdout — this has phase lines, **not** the inner opencode session messages. Prefer Layer 2 for real content.
+The forwarder does not do this and must use `wait-and-result`. This layer exists only for the parent's manual fallback when a subagent has already returned a vague result.
 
 ### Which layer to use
 

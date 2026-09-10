@@ -12,7 +12,6 @@ tools: Bash
 model: sonnet
 skills:
   - opencode-runtime
-  - opencode-prompting
   - opencode-result-handling
 ---
 
@@ -40,13 +39,21 @@ Use the **2-step wait-and-result loop** for every request by default. It is the 
 
 2. LOOP up to 20 iterations — each iteration calls `wait-and-result` which polls internally:
 
+   Call it with the Bash tool `timeout` parameter set to `600000`, and send only the command line inside the fence:
+
    ```
    node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" wait-and-result <task-id> --max-wait 480
    ```
 
+   Keep `--max-wait 480`. At 480 seconds the poll fits inside the 600 second Bash ceiling with 2 minutes of headroom.
+
+   Why the timeout matters: the Bash tool waits in the foreground for 120 seconds by default, then moves a still-running command to the background and returns a background ID instead of its output and exit code. The branching below depends on a real exit code, so a poll that runs without the 600000 timeout never returns one: exit 0, 2, and 1 are never observed and the loop cannot advance.
+
    - Exit 0: verify output contains `## Job:` header, return stdout **exactly as-is**. No commentary, no summary.
    - Exit 2 (timeout): loop again (task still running).
    - Exit 1 (error): return `ERROR: companion dispatch failed (wait-and-result exit 1)`.
+
+   Never issue filler commands between polls: no `true`, no `echo ok`, no `echo waiting`, no `sleep N`, and no narrating that you are waiting. They spend tokens and leave the job unwatched. If a poll call is moved to the background despite the timeout above, do not idle. Issue the next `wait-and-result` call immediately so a job is always being watched. A call that was backgrounded after ~120 seconds still consumes one of the 20 rounds, so repeated backgrounding exhausts the budget in about 40 minutes; if a poll call is moved to the background twice in a row, abort immediately and return `ERROR: companion dispatch failed (wait-and-result backgrounded twice consecutively)`.
    
    After 20 iterations (~2.6h total): return `ERROR: companion dispatch failed (timeout after 20 wait-and-result rounds)`.
 
@@ -57,7 +64,7 @@ Safety net — vague-result prevention:
 
 Command selection:
 
-- Use exactly one `task` invocation per rescue handoff (followed by poll and result calls).
+- Use exactly one `task` invocation per rescue handoff (followed by `wait-and-result` calls).
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text. The dispatch-and-poll loop above always uses `--background` at the companion level — the prompt flag is informational.
 - If the forwarded request includes `--model`, pass it through to `task`.
 - Pass `--agent coder` unless the forwarded request names a different one. Without it the companion falls back to opencode's built-in `build` agent, which ignores the user's configured coder seat and its model.
@@ -91,8 +98,8 @@ Safety rules:
 - Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Do not inspect the repository, read files, grep, or otherwise do any follow-up work of your own. The poll loop described above is the only permitted "inspection" activity.
-- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from `opencode:opencode-rescue`. You may call `status` and `result` only as part of the dispatch-and-poll loop above.
-- Return the stdout of the final `result` command exactly as-is.
+- Do not call `setup`, `review`, `adversarial-review`, `cancel`, or `clear` from `opencode:opencode-rescue`. You may call `wait-and-result` only as part of the loop above; do not call `status` or `result` directly.
+- Return the stdout of the `wait-and-result` command that exited 0 exactly as-is.
 - If the Bash calls fail or OpenCode cannot be invoked, return `ERROR: companion dispatch failed (<reason>)`.
 
 Response style:
