@@ -3,7 +3,7 @@ import path from "node:path";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createTmpDir, cleanupTmpDir, setupTestEnv } from "./helpers.mjs";
-import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot } from "../plugins/opencode/scripts/lib/state.mjs";
+import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot, listActiveJobs } from "../plugins/opencode/scripts/lib/state.mjs";
 import { createJobRecord, runTrackedJob, createProgressReporter } from "../plugins/opencode/scripts/lib/tracked-jobs.mjs";
 
 let tmpDir;
@@ -201,5 +201,56 @@ describe("state", () => {
     } finally {
       process.stderr.write = originalStderrWrite;
     }
+  });
+});
+
+describe("listActiveJobs", () => {
+  let tmp;
+  const wsA = "/test/ws-a";
+  const wsB = "/test/ws-b";
+
+  beforeEach(() => {
+    tmp = createTmpDir();
+    setupTestEnv(tmp);
+  });
+  afterEach(() => cleanupTmpDir(tmp));
+
+  it("counts running jobs from every workspace sharing the state root", () => {
+    upsertJob(wsA, { id: "a1", status: "running", agent: "coder" });
+    upsertJob(wsB, { id: "b1", status: "queued", agent: "coder" });
+    upsertJob(wsB, { id: "b2", status: "completed", agent: "coder" });
+
+    const active = listActiveJobs(wsA);
+    assert.deepEqual(
+      active.map((j) => j.id).sort(),
+      ["a1", "b1"],
+      "a terminal job releases its slot; a queued one in another workspace does not",
+    );
+  });
+
+  it("stops counting a job whose record and log have both gone stale", () => {
+    upsertJob(wsA, { id: "stale", status: "running", agent: "coder" });
+    upsertJob(wsA, { id: "fresh", status: "running", agent: "coder" });
+
+    // An hour later, with the default 15 minute staleness window, a worker
+    // that died without writing a terminal status must not hold a slot.
+    const oneHourOn = Date.now() + 3_600_000;
+    assert.equal(listActiveJobs(wsA, oneHourOn).length, 0);
+    assert.equal(listActiveJobs(wsA).length, 2);
+  });
+
+  it("keeps counting a quiet job whose log is still being appended", () => {
+    upsertJob(wsA, { id: "thinking", status: "running", agent: "coder" });
+    const logFile = path.join(stateRoot(wsA), "jobs", "thinking.log");
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    fs.writeFileSync(logFile, "[2026-09-11T00:00:00.000Z] working\n");
+
+    const soon = Date.now() + 3_600_000;
+    fs.utimesSync(logFile, new Date(soon), new Date(soon));
+    assert.equal(listActiveJobs(wsA, soon).length, 1, "a growing log means alive");
+  });
+
+  it("returns nothing when the state root does not exist yet", () => {
+    assert.deepEqual(listActiveJobs("/test/never-used"), []);
   });
 });

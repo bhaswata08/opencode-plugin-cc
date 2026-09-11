@@ -428,6 +428,68 @@ export function upsertJob(workspacePath, job) {
   });
 }
 
+// Statuses that still hold a slot on a model. "pending" and "queued" count
+// because the worker is already committed to starting; only a terminal status
+// releases the slot.
+const ACTIVE_STATUSES = new Set(["pending", "queued", "running"]);
+
+// How long a job record may go untouched before it stops counting against the
+// concurrency cap. A worker killed with SIGKILL leaves its record reading
+// "running" forever, and a cap that one dead record can wedge shut is worse
+// than no cap. Liveness comes from the job's own trace log rather than from
+// the state record, because the log is appended on every tool call whether or
+// not the record is rewritten.
+const STALE_ACTIVE_MS = Number(process.env.OPENCODE_ACTIVE_STALE_MS) || 900_000;
+
+/**
+ * Every job still holding a slot, across every workspace sharing this state
+ * root. Cross-workspace on purpose: two Claude Code sessions in different
+ * repos draw on the same provider account, and neither can see the other.
+ *
+ * @param {string} workspacePath  any workspace; only its state root is used
+ * @param {number} [now]
+ * @returns {Array<{id: string, agent: string|undefined, status: string, workspacePath: string}>}
+ */
+export function listActiveJobs(workspacePath, now = Date.now()) {
+  const base = path.dirname(stateRoot(workspacePath));
+  let entries;
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const active = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(base, entry.name);
+    const state = readJson(path.join(dir, "state.json"));
+    if (!state || !Array.isArray(state.jobs)) continue;
+
+    for (const job of state.jobs) {
+      if (!ACTIVE_STATUSES.has(String(job.status))) continue;
+
+      let logTouched = 0;
+      const logFile = job.logFile || path.join(dir, "jobs", `${job.id}.log`);
+      try {
+        logTouched = fs.statSync(logFile).mtimeMs;
+      } catch {
+        // No log yet: the job may have only just been recorded.
+      }
+      const recordTouched = Date.parse(job.updatedAt ?? job.createdAt ?? "") || 0;
+      if (now - Math.max(logTouched, recordTouched) > STALE_ACTIVE_MS) continue;
+
+      active.push({
+        id: job.id,
+        agent: job.agent,
+        status: String(job.status),
+        workspacePath: state.workspacePath ?? dir,
+      });
+    }
+  }
+  return active;
+}
+
 /**
  * Get the path for a job's log file.
  * @param {string} workspacePath

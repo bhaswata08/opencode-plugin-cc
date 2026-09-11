@@ -12,7 +12,7 @@ import { parseArgs, extractTaskText } from "./lib/args.mjs";
 import { spawnDetached } from "./lib/process.mjs";
 import { isServerRunning, ensureServer, createClient, connect, resolveBackendName, validateBackend, effectiveSessionId, isBackendInstalled, getBackendVersion } from "./lib/backend.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
-import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath } from "./lib/state.mjs";
+import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath, listActiveJobs } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "./lib/render.mjs";
@@ -302,6 +302,47 @@ async function handleAdversarialReview(argv) {
 // Task (rescue delegation)
 // ------------------------------------------------------------------
 
+// Seats that spend a coding allowance. Review seats are excluded: they run a
+// handful of times a week and are already serialised by their provider.
+const CODING_AGENTS = new Set(["coder", "build"]);
+
+// Ceiling on coding jobs in flight at once, across every workspace on this
+// machine. Two is deliberate. A six-way fan-out drained a five-hour provider
+// window in thirty-five minutes, and roughly half of that overlap came from
+// separate Claude Code sessions in the same repo, so no per-session rule can
+// see it. Set OPENCODE_MAX_CONCURRENT to raise it for a run that needs more.
+const MAX_CONCURRENT_CODING = Number(process.env.OPENCODE_MAX_CONCURRENT) || 2;
+
+/**
+ * Message explaining why this job may not start, or null when it may.
+ * Checked before any model is contacted, so a refusal costs nothing.
+ *
+ * @param {string} workspace
+ * @param {string} agentName
+ * @returns {string|null}
+ */
+function concurrencyRefusal(workspace, agentName) {
+  if (!CODING_AGENTS.has(String(agentName))) return null;
+  if (MAX_CONCURRENT_CODING <= 0) return null;
+
+  const active = listActiveJobs(workspace).filter((j) =>
+    CODING_AGENTS.has(String(j.agent)),
+  );
+  if (active.length < MAX_CONCURRENT_CODING) return null;
+
+  const lines = active.map(
+    (j) => `  ${j.id}  ${j.status}  ${j.workspacePath}`,
+  );
+  return [
+    `Refusing to start: ${active.length} coding job(s) already in flight, ` +
+      `cap is ${MAX_CONCURRENT_CODING}.`,
+    ...lines,
+    "",
+    "Wait for one to finish, cancel one with `cancel <id>`, or raise the cap",
+    "for this run with OPENCODE_MAX_CONCURRENT=<n>.",
+  ].join("\n");
+}
+
 async function handleTask(argv) {
   let options, positional;
   try {
@@ -389,6 +430,12 @@ async function handleTask(argv) {
     model: options.model,
     backend: initialBackend,
   };
+
+  const refusal = concurrencyRefusal(workspace, agentName);
+  if (refusal) {
+    console.error(refusal);
+    process.exit(1);
+  }
 
   const job = createJobRecord(workspace, "task", {
     agent: agentName,

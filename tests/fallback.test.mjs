@@ -741,3 +741,58 @@ test("stalled stream error triggers runWithFallback to retry on agy", async () =
   assert.equal(out.usedFallback, true);
   assert.equal(out.value, "recovered on fallback");
 });
+
+test("a fallback onto the target the primary just exhausted is refused", async () => {
+  const attempts = [];
+  const err = new Error("agy run ERROR: Individual quota reached. Resets in 12h.");
+  process.env.AGY_MODEL = "gemini-3.8-flash-high";
+  try {
+    await assert.rejects(
+      runWithFallback({
+        agent: "coder",
+        model: "gemini-3.8-flash-high",
+        backend: "agy",
+        attempt: async (opts) => {
+          attempts.push(opts.backend);
+          throw err;
+        },
+        log: () => {},
+      }),
+      /Individual quota reached/,
+    );
+  } finally {
+    delete process.env.AGY_MODEL;
+  }
+  assert.equal(attempts.length, 1, "must not retry the same exhausted target");
+});
+
+test("a socket failure on the same target still gets its one retry", async () => {
+  const attempts = [];
+  process.env.AGY_MODEL = "gemini-3.8-flash-high";
+  try {
+    await runWithFallback({
+      agent: "coder",
+      model: "gemini-3.8-flash-high",
+      backend: "agy",
+      attempt: async (opts) => {
+        attempts.push(opts.backend);
+        if (attempts.length === 1) throw new Error("fetch failed");
+        return { text: "done", value: "done" };
+      },
+      log: () => {},
+    });
+  } finally {
+    delete process.env.AGY_MODEL;
+  }
+  assert.equal(attempts.length, 2, "a transient failure is worth one retry");
+});
+
+test("isExhaustionFailure separates no-allowance from unreachable", async () => {
+  const { isExhaustionFailure } = await import(
+    "../plugins/opencode/scripts/lib/fallback.mjs"
+  );
+  assert.ok(isExhaustionFailure(new Error("Rate limit exceeded. Try again later.")));
+  assert.ok(isExhaustionFailure(new Error("Individual quota reached.")));
+  assert.ok(!isExhaustionFailure(new Error("fetch failed")));
+  assert.ok(!isExhaustionFailure(new Error("session idle timeout: 601s > 600s")));
+});

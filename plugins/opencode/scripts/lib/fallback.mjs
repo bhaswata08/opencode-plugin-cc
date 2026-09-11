@@ -81,6 +81,28 @@ const TRANSPORT_PATTERNS = [
   /empty response/i,
 ];
 
+// Exhaustion specifically: the credential is fine and the model exists, but
+// there is no allowance left on it. Unlike a socket blip, retrying the same
+// target cannot help, because the allowance is attached to the account rather
+// than to the connection.
+const EXHAUSTION_PATTERNS = [
+  /rate[\s_-]?limit/i,
+  /\bquota\b/i,
+  /\b429\b/,
+  /returned\s+429\b/,
+];
+
+/**
+ * Is this failure "no allowance left" rather than "could not reach it"?
+ * @param {any} err
+ * @returns {boolean}
+ */
+export function isExhaustionFailure(err) {
+  if (!err) return false;
+  const msg = String(err.message ?? err);
+  return EXHAUSTION_PATTERNS.some((re) => re.test(msg));
+}
+
 /**
  * Does this failure mean the model was unreachable, rather than that the agent
  * ran and produced a bad result?
@@ -193,6 +215,28 @@ export async function runWithFallback({
 
   const fallbackBackend = fb.backend ?? primaryBackend;
   const fallbackModel = fb.model ?? (fallbackBackend === primaryBackend ? model : undefined);
+
+  // A fallback that lands on the same backend and model the primary just used
+  // is not a fallback. It draws on the same allowance and fails the same way,
+  // which is what happened to jobs dispatched with --backend agy: the primary
+  // hit the agy account quota and the fallback, also agy gemini, reported the
+  // identical "Individual quota reached". Only refuse for exhaustion, because
+  // a socket blip on the same target really is worth one retry. An `agent`
+  // swap is always allowed through: it carries a different model with it.
+  const primaryModel =
+    primaryBackend === "agy" ? process.env.AGY_MODEL || model : model;
+  if (
+    !fb.agent &&
+    fallbackBackend === primaryBackend &&
+    (fallbackModel ?? primaryModel) === primaryModel &&
+    isExhaustionFailure(firstError)
+  ) {
+    log(
+      `No fallback: ${fallbackModel ?? "the fallback"} is the same ${fallbackBackend} ` +
+        `target the primary just exhausted.`,
+    );
+    throw firstError;
+  }
 
   const previousBackend = process.env.OPENCODE_BACKEND;
   if (fb.backend) process.env.OPENCODE_BACKEND = fb.backend;
