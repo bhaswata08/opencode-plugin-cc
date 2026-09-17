@@ -1024,15 +1024,22 @@ async function handleClear(argv) {
     }
   }
 
-  const workspace = await resolveWorkspace(options.workspace);
-
-  // Reject an explicit workspace that has no companion state. When clear is
-  // run for cwd, an empty/uninitialised workspace is harmless (clear reports
-  // 0 pruned), but targeting an explicit --workspace path that was never used
-  // with the companion almost certainly indicates a typo or stale workspace.
-  if (options.workspace !== undefined && !hasWorkspaceState(workspace)) {
-    console.error(`No companion state found for workspace: ${workspace}`);
-    process.exit(1);
+  let workspace;
+  if (options.workspace !== undefined) {
+    const resolvedLiteral = path.resolve(options.workspace);
+    if (hasWorkspaceState(resolvedLiteral)) {
+      workspace = resolvedLiteral;
+    } else {
+      const gitRootWorkspace = await resolveWorkspace(options.workspace);
+      if (hasWorkspaceState(gitRootWorkspace)) {
+        workspace = gitRootWorkspace;
+      } else {
+        console.error(`No companion state found for workspace: ${gitRootWorkspace}`);
+        process.exit(1);
+      }
+    }
+  } else {
+    workspace = await resolveWorkspace();
   }
 
   const state = loadState(workspace);

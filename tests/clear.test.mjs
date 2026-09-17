@@ -58,6 +58,15 @@ function runCompanionExpectingFailure(args, options = {}) {
   );
 }
 
+function initGitRepo(dir) {
+  execFileSync("git", ["init", "-b", "main"], { cwd: dir });
+  execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: dir });
+  fs.writeFileSync(path.join(dir, "README.md"), "# Test\n");
+  execFileSync("git", ["add", "."], { cwd: dir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: dir });
+}
+
 describe("clear subcommand", () => {
   it("clears only terminal jobs and preserves all live jobs", () => {
     // Only terminal statuses (completed, failed, cancelled) should be purged.
@@ -304,6 +313,112 @@ describe("clear subcommand", () => {
     // State on disk is untouched
     const state = loadState(otherWorkDir);
     assert.equal(state.jobs.length, 2);
+  });
+
+  it("clears literal workspace state and leaves git root state untouched when explicit --workspace has state", () => {
+    const repoDir = path.join(tmpDir, "repo-literal-and-root");
+    fs.mkdirSync(repoDir, { recursive: true });
+    initGitRepo(repoDir);
+
+    const subDir = path.join(repoDir, "sub");
+    fs.mkdirSync(subDir, { recursive: true });
+
+    // Seed state for both the git root and the literal subdirectory
+    saveState(repoDir, {
+      jobs: [
+        { id: "root-job", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+      ],
+    });
+    saveState(subDir, {
+      jobs: [
+        { id: "literal-sub-job", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+      ],
+    });
+
+    const output = runCompanion(["clear", "--workspace", subDir, "--json"]);
+    const result = JSON.parse(output.trim());
+
+    assert.equal(result.workspaceRoot, subDir);
+    assert.deepEqual(result.cleared, ["literal-sub-job"]);
+
+    // Literal workspace is cleared
+    const subState = loadState(subDir);
+    assert.equal(subState.jobs.length, 0);
+
+    // Git root state is left alone
+    const rootState = loadState(repoDir);
+    assert.equal(rootState.jobs.length, 1);
+    assert.equal(rootState.jobs[0].id, "root-job");
+  });
+
+  it("clears git root state as fallback when explicit --workspace has no state of its own", () => {
+    const repoDir = path.join(tmpDir, "repo-fallback");
+    fs.mkdirSync(repoDir, { recursive: true });
+    initGitRepo(repoDir);
+
+    const subDir = path.join(repoDir, "sub");
+    fs.mkdirSync(subDir, { recursive: true });
+
+    // Seed state only at the git root, not the subdirectory
+    saveState(repoDir, {
+      jobs: [
+        { id: "root-fallback-job", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+      ],
+    });
+
+    const output = runCompanion(["clear", "--workspace", subDir, "--json"]);
+    const result = JSON.parse(output.trim());
+
+    assert.equal(result.workspaceRoot, repoDir);
+    assert.deepEqual(result.cleared, ["root-fallback-job"]);
+
+    // Git root is cleared
+    const rootState = loadState(repoDir);
+    assert.equal(rootState.jobs.length, 0);
+  });
+
+  it("exits 1 with existing message when neither explicit --workspace nor its git root has state", () => {
+    const repoDir = path.join(tmpDir, "repo-empty");
+    fs.mkdirSync(repoDir, { recursive: true });
+    initGitRepo(repoDir);
+
+    const subDir = path.join(repoDir, "sub");
+    fs.mkdirSync(subDir, { recursive: true });
+
+    // Neither subDir nor repoDir has companion state
+    const run = runCompanionExpectingFailure(["clear", "--workspace", subDir]);
+    assert.equal(run.status, 1);
+    assert.ok(run.stderr.includes("No companion state found for workspace:"));
+    assert.ok(run.stderr.includes(repoDir));
+  });
+
+  it("preserves existing cwd behavior when --workspace is absent", () => {
+    const repoDir = path.join(tmpDir, "repo-cwd");
+    fs.mkdirSync(repoDir, { recursive: true });
+    initGitRepo(repoDir);
+
+    const subDir = path.join(repoDir, "sub");
+    fs.mkdirSync(subDir, { recursive: true });
+
+    saveState(repoDir, {
+      jobs: [
+        { id: "cwd-job", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+      ],
+    });
+
+    // Running clear with cwd=subDir resolves to git root repoDir and clears it
+    const output = runCompanion(["clear", "--json"], { cwd: subDir });
+    const result = JSON.parse(output.trim());
+
+    assert.equal(result.workspaceRoot, repoDir);
+    assert.deepEqual(result.cleared, ["cwd-job"]);
+
+    const rootState = loadState(repoDir);
+    assert.equal(rootState.jobs.length, 0);
+
+    // Empty/uninitialised cwd does not error with code 1; reports no terminal jobs
+    const emptyOutput = runCompanion(["clear"], { cwd: subDir });
+    assert.equal(emptyOutput.trim(), "No terminal jobs to clear.");
   });
 
   it("supports clear --help", () => {
