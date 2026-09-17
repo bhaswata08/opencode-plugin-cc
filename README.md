@@ -141,7 +141,8 @@ The companion now reconciles this automatically:
   to include jobs from other Claude sessions.
 - `companion.mjs clear` removes terminal jobs (completed, failed, cancelled) from
   state.json and deletes their log and data files. Pass `--keep <n>` to retain
-  the n most recent terminal jobs, `--dry-run` to preview, or `--json` for
+  the n most recent terminal jobs, `--workspace <path>` to scope the clear to a
+  specific workspace directory, `--dry-run` to preview, or `--json` for
   structured output.
 - `companion.mjs task` rejects any unrecognised `--flag` instead of folding it
   into the task text, so a typo fails fast rather than becoming the prompt. Pass

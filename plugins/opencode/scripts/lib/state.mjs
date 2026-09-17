@@ -336,6 +336,22 @@ export function loadState(workspacePath) {
 }
 
 /**
+ * Check whether a workspace has companion state on disk.
+ *
+ * loadState returns an empty placeholder { config: {}, jobs: [] } for missing
+ * state files, which makes uninitialised directories look identical to empty
+ * ones. Callers that accept explicit workspace paths (such as `clear --workspace`)
+ * need to reject targets that were never touched by the companion to guard
+ * against typos.
+ * @param {string} workspacePath
+ * @returns {boolean}
+ */
+export function hasWorkspaceState(workspacePath) {
+  const root = stateRoot(workspacePath);
+  return fs.existsSync(stateFile(root));
+}
+
+/**
  * Save the state for a workspace, stamping workspacePath onto state.
  * @param {string} workspacePath
  * @param {object} state

@@ -3,7 +3,7 @@ import path from "node:path";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createTmpDir, cleanupTmpDir, setupTestEnv } from "./helpers.mjs";
-import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot, listActiveJobs } from "../plugins/opencode/scripts/lib/state.mjs";
+import { loadState, saveState, updateState, generateJobId, upsertJob, stateRoot, listActiveJobs, hasWorkspaceState } from "../plugins/opencode/scripts/lib/state.mjs";
 import { createJobRecord, runTrackedJob, createProgressReporter } from "../plugins/opencode/scripts/lib/tracked-jobs.mjs";
 
 let tmpDir;
@@ -19,6 +19,12 @@ afterEach(() => {
 });
 
 describe("state", () => {
+  it("hasWorkspaceState returns false when uninitialised and true after saveState", () => {
+    assert.equal(hasWorkspaceState(workspace), false);
+    saveState(workspace, { jobs: [] });
+    assert.equal(hasWorkspaceState(workspace), true);
+  });
+
   it("loadState returns default when no file exists", () => {
     const state = loadState(workspace);
     assert.deepEqual(state, { config: {}, jobs: [] });

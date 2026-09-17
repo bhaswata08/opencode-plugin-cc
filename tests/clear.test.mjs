@@ -229,4 +229,86 @@ describe("clear subcommand", () => {
     assert.equal(invalidValue.status, 1);
     assert.ok(invalidValue.stderr.includes("--keep must be a non-negative integer."));
   });
+
+  it("scopes clear to the specified --workspace without touching current workspace", () => {
+    const otherWorkDir = path.join(tmpDir, "other-workspace");
+    fs.mkdirSync(otherWorkDir, { recursive: true });
+
+    // Seed state in both workspaces
+    saveState(workDir, {
+      jobs: [
+        { id: "cwd-term", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+        { id: "cwd-live", status: "running", updatedAt: "2026-01-01T11:00:00Z" },
+      ],
+    });
+    saveState(otherWorkDir, {
+      jobs: [
+        { id: "other-term", status: "completed", updatedAt: "2026-01-01T10:00:00Z" },
+        { id: "other-live", status: "running", updatedAt: "2026-01-01T11:00:00Z" },
+      ],
+    });
+
+    const output = runCompanion(["clear", "--workspace", otherWorkDir, "--json"]);
+    const result = JSON.parse(output.trim());
+
+    assert.equal(result.workspaceRoot, otherWorkDir);
+    assert.deepEqual(result.cleared, ["other-term"]);
+
+    // otherWorkDir has only live job left
+    const otherState = loadState(otherWorkDir);
+    assert.equal(otherState.jobs.length, 1);
+    assert.equal(otherState.jobs[0].id, "other-live");
+
+    // workDir (current workspace) was completely untouched
+    const cwdState = loadState(workDir);
+    assert.equal(cwdState.jobs.length, 2);
+    assert.ok(cwdState.jobs.some((j) => j.id === "cwd-term"));
+    assert.ok(cwdState.jobs.some((j) => j.id === "cwd-live"));
+  });
+
+  it("rejects --workspace for a path that has no companion state", () => {
+    const uninitialisedDir = path.join(tmpDir, "never-used-workspace");
+    fs.mkdirSync(uninitialisedDir, { recursive: true });
+
+    const run = runCompanionExpectingFailure(["clear", "--workspace", uninitialisedDir]);
+    assert.equal(run.status, 1);
+    assert.ok(run.stderr.includes("No companion state found for workspace:"));
+    assert.ok(run.stderr.includes(uninitialisedDir));
+  });
+
+  it("validates --workspace argument format", () => {
+    const missingValue = runCompanionExpectingFailure(["clear", "--workspace"]);
+    assert.equal(missingValue.status, 1);
+    assert.ok(missingValue.stderr.includes("--workspace requires a directory path."));
+  });
+
+  it("supports --workspace with --dry-run and --keep", () => {
+    const otherWorkDir = path.join(tmpDir, "preview-workspace");
+    fs.mkdirSync(otherWorkDir, { recursive: true });
+
+    saveState(otherWorkDir, {
+      jobs: [
+        { id: "preview-old", status: "completed", updatedAt: "2026-01-01T08:00:00Z" },
+        { id: "preview-new", status: "completed", updatedAt: "2026-01-01T09:00:00Z" },
+      ],
+    });
+
+    const output = runCompanion(["clear", "--workspace", otherWorkDir, "--keep", "1", "--dry-run", "--json"]);
+    const result = JSON.parse(output.trim());
+
+    assert.equal(result.workspaceRoot, otherWorkDir);
+    assert.equal(result.dryRun, true);
+    assert.equal(result.kept, 1);
+    assert.deepEqual(result.cleared, ["preview-old"]);
+
+    // State on disk is untouched
+    const state = loadState(otherWorkDir);
+    assert.equal(state.jobs.length, 2);
+  });
+
+  it("supports clear --help", () => {
+    const output = runCompanion(["clear", "--help"]);
+    assert.ok(output.includes("Usage: opencode-companion.mjs clear"));
+    assert.ok(output.includes("--workspace"));
+  });
 });

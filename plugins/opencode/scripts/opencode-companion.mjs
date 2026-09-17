@@ -12,7 +12,7 @@ import { parseArgs, extractTaskText } from "./lib/args.mjs";
 import { spawnDetached } from "./lib/process.mjs";
 import { isServerRunning, ensureServer, createClient, connect, resolveBackendName, validateBackend, effectiveSessionId, isBackendInstalled, getBackendVersion } from "./lib/backend.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
-import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath, listActiveJobs } from "./lib/state.mjs";
+import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPath, listActiveJobs, hasWorkspaceState } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "./lib/render.mjs";
@@ -990,9 +990,16 @@ async function handleCancel(argv) {
 
 async function handleClear(argv) {
   const { options } = parseArgs(argv ?? [], {
-    valueOptions: ["keep"],
-    booleanOptions: ["json", "dry-run"],
+    valueOptions: ["keep", "workspace"],
+    booleanOptions: ["json", "dry-run", "help"],
   });
+
+  if (options.help) {
+    console.log(
+      "Usage: opencode-companion.mjs clear [--keep <n>] [--workspace <path>] [--dry-run] [--json]"
+    );
+    return;
+  }
 
   let keepCount = 0;
   if (options.keep !== undefined) {
@@ -1010,7 +1017,24 @@ async function handleClear(argv) {
   const dryRun = Boolean(options["dry-run"]);
   const wantJson = Boolean(options.json);
 
-  const workspace = await resolveWorkspace();
+  if (options.workspace !== undefined) {
+    if (typeof options.workspace !== "string" || options.workspace.trim() === "") {
+      console.error("--workspace requires a directory path.");
+      process.exit(1);
+    }
+  }
+
+  const workspace = await resolveWorkspace(options.workspace);
+
+  // Reject an explicit workspace that has no companion state. When clear is
+  // run for cwd, an empty/uninitialised workspace is harmless (clear reports
+  // 0 pruned), but targeting an explicit --workspace path that was never used
+  // with the companion almost certainly indicates a typo or stale workspace.
+  if (options.workspace !== undefined && !hasWorkspaceState(workspace)) {
+    console.error(`No companion state found for workspace: ${workspace}`);
+    process.exit(1);
+  }
+
   const state = loadState(workspace);
   const jobs = state.jobs ?? [];
 
