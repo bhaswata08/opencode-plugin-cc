@@ -26,10 +26,20 @@ export function cleanupTmpDir(dir) {
 }
 
 /**
- * Set up environment for tests.
+ * Point the companion state root at a throwaway directory for one test.
+ *
+ * OPENCODE_COMPANION_DATA is the variable that matters: stateRoot() consults it
+ * before anything else, and it is exported in normal shells so the plugin and
+ * the oco TUI agree on where state lives. Setting only CLAUDE_PLUGIN_DATA, as
+ * this helper used to, isolated nothing — stateRoot() reaches that branch only
+ * when OPENCODE_COMPANION_DATA is unset AND the path basename names this
+ * plugin, so every test sharing this helper was reading and writing the real
+ * state directory instead of its own tmpDir.
+ *
  * @param {string} tmpDir
  */
 export function setupTestEnv(tmpDir) {
+  process.env.OPENCODE_COMPANION_DATA = tmpDir;
   process.env.CLAUDE_PLUGIN_DATA = tmpDir;
   process.env.OPENCODE_COMPANION_SESSION_ID = "test-session-001";
 }

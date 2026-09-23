@@ -9,7 +9,7 @@
     "node": ">=18.18.0"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --import ./tests/setup.mjs --test tests/*.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0"
