@@ -77,6 +77,25 @@ function buildReviewContext(diff, status, changedFiles) {
 }
 
 /**
+ * Repository context for the current working tree: status, changed files and
+ * diff, in the same block shape the review prompts use.
+ *
+ * The review loop rebuilds this between rounds instead of trusting the coder
+ * report of what it changed, so a verify pass reads the tree as it actually
+ * is.
+ *
+ * @param {string} cwd
+ * @param {{base?: string}} [opts]
+ * @returns {Promise<string>}
+ */
+export async function buildTreeContext(cwd, opts = {}) {
+  const diff = await getDiff(cwd, { base: opts.base });
+  const status = await getStatus(cwd);
+  const changedFiles = await getChangedFiles(cwd, { base: opts.base });
+  return buildReviewContext(diff, status, changedFiles);
+}
+
+/**
  * Safety header prepended to every task prompt sent into an opencode session.
  *
  * Background: task text often carries routing instructions inherited from
@@ -131,4 +150,92 @@ export function buildTaskPrompt(taskText, opts = {}) {
   parts.push(taskText);
 
   return parts.join("\n");
+}
+
+// ------------------------------------------------------------------
+// Review loop prompts
+// ------------------------------------------------------------------
+
+/**
+ * One finding, rendered for a prompt.
+ * @param {object} f
+ * @param {number} i
+ * @returns {string}
+ */
+function formatFinding(f, i) {
+  const where = f.file
+    ? `${f.file}:${f.line_start ?? "?"}${f.line_end && f.line_end !== f.line_start ? `-${f.line_end}` : ""}`
+    : "(no file given)";
+  const lines = [`${i + 1}. [${String(f.severity ?? "").toUpperCase()}] ${f.title} — ${where}`];
+  if (f.body) lines.push(`   ${f.body}`);
+  if (f.recommendation) lines.push(`   Recommendation: ${f.recommendation}`);
+  return lines.join("\n");
+}
+
+/**
+ * Send the reviewer's blocking findings back to the coder.
+ *
+ * Scope discipline is the whole point: a coder handed a review tends to keep
+ * going and rewrite things nobody asked about, which is what makes the next
+ * review round diverge instead of converge.
+ *
+ * @param {object[]} findings - blocking findings only
+ * @returns {string}
+ */
+export function buildFixPrompt(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) {
+    throw new Error("buildFixPrompt needs at least one finding");
+  }
+
+  return [
+    SAFETY_HEADER,
+    "",
+    "A code review of the current change reported the problems below.",
+    "Task: fix them in the working tree.",
+    "",
+    findings.map(formatFinding).join("\n"),
+    "",
+    "Constraints:",
+    "- Fix only what is listed. No refactoring, renaming, or redesign beyond it.",
+    "- If a finding is incorrect, leave the code unchanged and state why in the output.",
+    "- Re-run the project's own tests afterwards and report their result.",
+    "- List the files changed.",
+  ].join("\n");
+}
+
+/**
+ * Ask the reviewer whether its own findings were addressed.
+ *
+ * Deliberately not a second full review: re-reviewing the whole change every
+ * round re-litigates design choices that already passed, so the loop never
+ * reaches a clean state and just spends rounds.
+ *
+ * @param {object[]} findings - the findings the coder was asked to fix
+ * @param {string} diffContext - repository context block for the current tree
+ * @returns {string}
+ */
+export function buildVerifyPrompt(findings, diffContext) {
+  if (!Array.isArray(findings) || findings.length === 0) {
+    throw new Error("buildVerifyPrompt needs at least one finding to verify");
+  }
+
+  return [
+    "An earlier review of this change reported the findings below. A fix has",
+    "since been applied to the working tree.",
+    "",
+    findings.map(formatFinding).join("\n"),
+    "",
+    "Task: assess the current state of the tree on two points only.",
+    "1. Whether each finding above is addressed.",
+    "2. Whether the fix introduced a new correctness problem.",
+    "",
+    "Out of scope: design decisions that the earlier review already passed, and",
+    "style, naming, or structural preferences. This pass covers the findings",
+    "above and regressions caused by the fix, nothing else.",
+    "",
+    "Output: the same JSON review format, listing a finding only when it is",
+    "still open or newly introduced.",
+    "",
+    diffContext,
+  ].join("\n");
 }

@@ -16,15 +16,16 @@ import { loadState, updateState, upsertJob, generateJobId, jobDataPath, jobLogPa
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, matchJobReference } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "./lib/render.mjs";
-import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
-import { getDiff, getStatus as getGitStatus } from "./lib/git.mjs";
+import { buildReviewPrompt, buildTaskPrompt, buildFixPrompt, buildVerifyPrompt, buildTreeContext } from "./lib/prompts.mjs";
+import { getDiff, getStatus as getGitStatus, getDiffStat, getChangedFiles, getUntrackedFiles, parseShortstat } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
 import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-heal.mjs";
 import { ensureOpencodeConfig, readOpencodeConfig, missingPermissions, resolveConfigPath } from "./lib/opencode-config.mjs";
 import { stateRoot } from "./lib/state.mjs";
 import { runCommand } from "./lib/process.mjs";
 import { getCapability, readAgySettings } from "./lib/agy-runner.mjs";
-import { runWithFallback } from "./lib/fallback.mjs";
+import { runWithFallback, resolveSeatDefault } from "./lib/fallback.mjs";
+import { shouldRunLoop, runReviewLoop, renderLoopOutcome } from "./lib/review-loop.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -343,11 +344,157 @@ function concurrencyRefusal(workspace, agentName) {
   ].join("\n");
 }
 
+/**
+ * Reviewer -> coder loop for a write dispatch that has just finished.
+ *
+ * Runs INSIDE the caller already-tracked job on purpose: the job holds one
+ * coding-concurrency slot, and the loop must hold that same slot for its whole
+ * life rather than releasing it between rounds. A loop that re-acquired per
+ * round would multiply a two-job cap into a six-job fan-out.
+ *
+ * Returns null when the trigger policy says not to run, so the caller output
+ * is unchanged for the dispatches that should not pay for a review.
+ *
+ * @returns {Promise<{summary: string, loop: object}|null>}
+ */
+async function maybeRunReviewLoop({
+  workspace,
+  jobId,
+  agentName,
+  isWrite,
+  resumed,
+  rounds,
+  coderClient,
+  coderSessionId,
+  coderModel,
+  coderBackend,
+  report,
+  log,
+}) {
+  // Read the size from git, never from the coder own account of what it did.
+  const stat = parseShortstat(await getDiffStat(workspace));
+  const tracked = await getChangedFiles(workspace);
+  const untracked = await getUntrackedFiles(workspace);
+  const changedFiles = [...new Set([...tracked, ...untracked])];
+
+  const decision = shouldRunLoop({
+    isWrite,
+    changedFiles,
+    changedLines: stat.lines,
+    resumed,
+    rounds,
+  });
+  if (!decision.run) {
+    log(`Review loop skipped: ${decision.reason}.`);
+    return null;
+  }
+  log(`Review loop starting: ${decision.reason}.`);
+
+  // The reviewer seat is resolved explicitly rather than from
+  // OPENCODE_BACKEND, which the coder dispatch may have just pinned to agy.
+  // The reviewer credential lives on opencode; inheriting the coder transport
+  // would silently review on the wrong account.
+  const reviewerBackend = resolveSeatDefault("reviewer")?.backend ?? "opencode";
+
+  const runReviewPass = async ({ round, previousFindings }) => {
+    report("reviewing", round === 1 ? "Reviewing the change..." : "Verifying the fix...");
+
+    const prompt =
+      round === 1
+        ? await buildReviewPrompt(workspace, { adversarial: false }, PLUGIN_ROOT)
+        : buildVerifyPrompt(previousFindings, await buildTreeContext(workspace));
+
+    let reviewClient;
+    let reviewSessionId;
+    const { value, usedFallback, handoff } = await runWithFallback({
+      agent: "reviewer",
+      backend: reviewerBackend,
+      log,
+      connect: async (backend) => {
+        const client = await connect({ cwd: workspace, backend });
+        const session = await client.createSession({
+          title: `Review loop ${jobId} round ${round}`,
+        });
+        reviewClient = client;
+        reviewSessionId = session.id;
+        return { client, session };
+      },
+      attempt: async (sel, ctx) => {
+        const client = ctx?.client ?? reviewClient;
+        const session = ctx?.session ?? { id: reviewSessionId };
+        const response = await client.sendPrompt(session.id, prompt, {
+          agent: sel.agent,
+          model: sel.model,
+          onProgress: (line) => log(line),
+        });
+        const t = extractResponseText(response);
+        return { text: t, value: t };
+      },
+    });
+
+    if (handoff) return { handoff };
+
+    const structured = tryParseJson(value);
+    if (!structured) {
+      // An unparseable review cannot be partitioned by severity, so it cannot
+      // be fed back safely. Surface it instead of guessing at what blocks.
+      log("Review loop: reviewer returned no parseable findings; treating as advisory.");
+      return { findings: [], usedFallback, raw: value };
+    }
+    return { findings: structured.findings ?? [], usedFallback, raw: value };
+  };
+
+  const runFixPass = async ({ findings }) => {
+    report("editing", `Sending ${findings.length} finding(s) back to the coder...`);
+    const prompt = buildFixPrompt(findings);
+
+    const { usedFallback, handoff } = await runWithFallback({
+      agent: agentName,
+      model: coderModel,
+      backend: coderBackend,
+      log,
+      attempt: async (sel) => {
+        const response = await coderClient.sendPrompt(coderSessionId, prompt, {
+          agent: sel.agent,
+          model: sel.model,
+          onProgress: (line) => log(line),
+        });
+        const t = extractResponseText(response);
+        return { text: t, value: t };
+      },
+    });
+    return { usedFallback, handoff };
+  };
+
+  const loop = await runReviewLoop({
+    review: runReviewPass,
+    fix: runFixPass,
+    maxRounds: rounds > 0 ? rounds : undefined,
+    log,
+  });
+
+  // The marker the stop-time review gate reads, so the same change is not
+  // reviewed twice by two different mechanisms.
+  upsertJob(workspace, {
+    id: jobId,
+    reviewLoop: {
+      status: loop.status,
+      reason: loop.reason,
+      fixRounds: loop.fixRounds,
+      openFindings: loop.findings.length,
+      advisoryFindings: loop.advisory.length,
+      completedAt: new Date().toISOString(),
+    },
+  });
+
+  return { summary: renderLoopOutcome(loop), loop };
+}
+
 async function handleTask(argv) {
   let options, positional;
   try {
     ({ options, positional } = parseArgs(argv, {
-      valueOptions: ["model", "agent", "task-file", "backend"],
+      valueOptions: ["model", "agent", "task-file", "backend", "review-rounds"],
       booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
       rejectUnknown: true,
     }));
@@ -401,11 +548,33 @@ async function handleTask(argv) {
       process.exit(1);
     }
   }
-  const initialBackend = explicitBackend ?? resolveBackendName();
+
+  // --review-rounds: 0 turns the loop off, N caps it. Absent means the
+  // trigger policy decides from the size of the diff.
+  let reviewRounds;
+  if (options["review-rounds"] !== undefined) {
+    reviewRounds = Number(options["review-rounds"]);
+    if (!Number.isInteger(reviewRounds) || reviewRounds < 0) {
+      console.error("--review-rounds needs a non-negative integer.");
+      process.exit(1);
+    }
+  }
 
   const workspace = await resolveWorkspace();
   const isWrite = options.write !== undefined ? options.write : true;
   const agentName = options.agent ?? (isWrite ? "build" : "plan");
+
+  // A seat can pin its own default transport (coder -> agy). An explicit
+  // --backend always wins; only an unpinned dispatch falls through to it.
+  const seatDefault = explicitBackend === undefined ? resolveSeatDefault(agentName) : null;
+  const initialBackend = explicitBackend ?? seatDefault?.backend ?? resolveBackendName();
+  const initialModel = options.model ?? seatDefault?.model;
+  // Keep OPENCODE_BACKEND consistent with what this dispatch actually runs
+  // on, including a seat default picked implicitly, so any later
+  // resolveBackendName() call in this process (diagnostics, a nested helper
+  // invoked without an explicit backend) agrees with it instead of reporting
+  // "opencode" for a job that is really running on agy.
+  process.env.OPENCODE_BACKEND = initialBackend;
 
   // Check for resume
   let resumeSessionId = null;
@@ -427,7 +596,7 @@ async function handleTask(argv) {
     agentName,
     isWrite,
     resumeSessionId,
-    model: options.model,
+    model: initialModel,
     backend: initialBackend,
   };
 
@@ -467,8 +636,14 @@ async function handleTask(argv) {
     ];
     if (isWrite) workerArgs.push("--write");
     if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
-    if (options.model) workerArgs.push("--model", options.model);
-    if (explicitBackend) workerArgs.push("--backend", explicitBackend);
+    if (initialModel) workerArgs.push("--model", initialModel);
+    if (reviewRounds !== undefined) {
+      workerArgs.push("--review-rounds", String(reviewRounds));
+    }
+    // Always forward the resolved backend, including one picked implicitly by
+    // a seat default, so the worker doesn't have to re-derive it and cannot
+    // disagree with what was just reported to the caller.
+    workerArgs.push("--backend", initialBackend);
 
     const child = spawnDetached("node", workerArgs, {
       cwd: workspace,
@@ -491,7 +666,7 @@ async function handleTask(argv) {
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
 
       report("investigating", "Sending task to OpenCode...");
-      log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars`);
+      log(`Agent: ${agentName}, Backend: ${initialBackend}, Write: ${isWrite}, Prompt: ${prompt.length} chars`);
 
       let activeClient;
       let activeSessionId;
@@ -515,7 +690,7 @@ async function handleTask(argv) {
 
       const { value, usedFallback, handoff } = await runWithFallback({
         agent: agentName,
-        model: options.model,
+        model: initialModel,
         backend: initialBackend,
         log,
         connect: connectSession,
@@ -548,7 +723,23 @@ async function handleTask(argv) {
 
       const text = value.text;
 
-      // Get changed files if write mode
+      const loopResult = await maybeRunReviewLoop({
+        workspace,
+        jobId: job.id,
+        agentName,
+        isWrite,
+        resumed: Boolean(resumeSessionId),
+        rounds: reviewRounds,
+        coderClient: activeClient,
+        coderSessionId: activeSessionId,
+        coderModel: initialModel,
+        coderBackend: initialBackend,
+        report,
+        log,
+      });
+
+      // Read the changed files AFTER the loop: a fix round edits the same
+      // session, so a list taken before it would miss whatever the fix touched.
       let changedFiles = [];
       if (isWrite && activeClient) {
         try {
@@ -562,9 +753,10 @@ async function handleTask(argv) {
       }
 
       return {
-        rendered: text,
+        rendered: loopResult ? `${text}\n\n---\n\n${loopResult.summary}` : text,
         messages: value.response,
         changedFiles,
+        reviewLoop: loopResult?.loop ?? null,
         summary: text.slice(0, 500),
       };
     });
@@ -578,7 +770,7 @@ async function handleTask(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseArgs(argv, {
-    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session", "backend"],
+    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session", "backend", "review-rounds"],
     booleanOptions: ["write"],
   });
 
@@ -588,6 +780,8 @@ async function handleTaskWorker(argv) {
   const agentName = options.agent ?? "build";
   const isWrite = !!options.write;
   const resumeSessionId = options["resume-session"];
+  const reviewRounds =
+    options["review-rounds"] !== undefined ? Number(options["review-rounds"]) : undefined;
 
   if (!workspace || !jobId || !taskText) {
     process.exit(1);
@@ -664,9 +858,26 @@ async function handleTaskWorker(argv) {
 
       const text = value;
       if (usedFallback) upsertJob(workspace, { id: jobId, usedFallback: true });
+
+      const loopResult = await maybeRunReviewLoop({
+        workspace,
+        jobId,
+        agentName,
+        isWrite,
+        resumed: Boolean(resumeSessionId),
+        rounds: reviewRounds,
+        coderClient: activeClient,
+        coderSessionId: activeSessionId,
+        coderModel: options.model,
+        coderBackend: initialBackend,
+        report,
+        log,
+      });
+
       report("finalizing", usedFallback ? "Done (on fallback model)" : "Done");
 
-      return { rendered: text, summary: text.slice(0, 500) };
+      const rendered = loopResult ? `${text}\n\n---\n\n${loopResult.summary}` : text;
+      return { rendered, summary: text.slice(0, 500) };
     });
   } catch (err) {
     // Error is already logged by runTrackedJob
@@ -924,11 +1135,42 @@ async function handleWaitAndResult(argv) {
   process.exit(2);
 }
 
+/**
+ * Resolve the workspace a command should act on.
+ *
+ * The all-workspaces view of the TUI lists jobs from every repository on the
+ * machine, so a command driven from there has to name the workspace the job
+ * belongs to rather than inherit the caller cwd. An explicit path is taken
+ * literally when it already holds companion state, and otherwise resolved to
+ * its git root, so either a worktree path or a subdirectory of one works.
+ *
+ * @param {string|boolean|undefined} option - the raw --workspace value
+ * @param {string} flagLabel - how to name the flag in errors
+ * @returns {Promise<string>} exits the process when the path names no state
+ */
+async function resolveWorkspaceOption(option, flagLabel = "--workspace") {
+  if (option === undefined) return resolveWorkspace();
+
+  if (typeof option !== "string" || option.trim() === "") {
+    console.error(`${flagLabel} requires a directory path.`);
+    process.exit(1);
+  }
+
+  const literal = path.resolve(option);
+  if (hasWorkspaceState(literal)) return literal;
+
+  const gitRoot = await resolveWorkspace(option);
+  if (hasWorkspaceState(gitRoot)) return gitRoot;
+
+  console.error(`No companion state found for workspace: ${gitRoot}`);
+  process.exit(1);
+}
+
 async function handleCancel(argv) {
-  const { positional } = parseArgs(argv, {});
+  const { options, positional } = parseArgs(argv, { valueOptions: ["workspace"] });
   const ref = positional[0];
 
-  const workspace = await resolveWorkspace();
+  const workspace = await resolveWorkspaceOption(options.workspace);
   const state = loadState(workspace);
 
   const { job, ambiguous } = resolveCancelableJob(state.jobs ?? [], ref);

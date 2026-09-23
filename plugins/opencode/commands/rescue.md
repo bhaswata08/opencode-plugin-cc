@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the OpenCode rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <provider/model>] [--agent <coder|reviewer|adversary>] [--backend <opencode|agy>] [what OpenCode should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--model <provider/model>] [--agent <coder|reviewer|adversary>] [--backend <opencode|agy>] [--review-rounds <n>] [what OpenCode should investigate, solve, or continue]"
 context: fork
 allowed-tools: Bash(node:*)
 ---

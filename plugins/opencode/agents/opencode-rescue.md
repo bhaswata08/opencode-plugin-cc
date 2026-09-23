@@ -88,7 +88,8 @@ Flag handling (since 1.10.0-agy):
 
 - `task` rejects any `--flag` it does not declare and exits non-zero, naming the
   flag and listing what it accepts: `--agent`, `--backend`, `--background`,
-  `--fresh`, `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`. It
+  `--fresh`, `--model`, `--resume-last`, `--review-rounds`, `--task-file`,
+  `--wait`, `--write`. It
   used to fold an unrecognised flag into the prompt and run anyway, so a stripping
   mistake silently became the task text and spent quota on nothing. Getting the
   stripping wrong now fails the dispatch outright, which you report as

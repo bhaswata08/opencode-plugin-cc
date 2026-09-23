@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createTmpDir, cleanupTmpDir } from "./helpers.mjs";
 import { runCommand } from "../plugins/opencode/scripts/lib/process.mjs";
-import { getGitRoot, getCurrentBranch, getStatus } from "../plugins/opencode/scripts/lib/git.mjs";
+import { getGitRoot, getCurrentBranch, getStatus, parseShortstat } from "../plugins/opencode/scripts/lib/git.mjs";
 
 let tmpDir;
 
@@ -45,5 +45,39 @@ describe("git", () => {
     fs.writeFileSync(path.join(tmpDir, "new-file.txt"), "hello\n");
     const status = await getStatus(tmpDir);
     assert.ok(status.includes("new-file.txt"));
+  });
+});
+
+// ------------------------------------------------------------------
+// Diff size, for the review loop's trigger floor
+// ------------------------------------------------------------------
+
+describe("parseShortstat", () => {
+  it("counts insertions and deletions together", () => {
+    const got = parseShortstat(" 3 files changed, 40 insertions(+), 2 deletions(-)");
+    assert.deepEqual(got, { files: 3, lines: 42 });
+  });
+
+  it("handles a stat with insertions only", () => {
+    assert.deepEqual(parseShortstat(" 1 file changed, 12 insertions(+)"), {
+      files: 1,
+      lines: 12,
+    });
+  });
+
+  it("handles a stat with deletions only", () => {
+    assert.deepEqual(parseShortstat(" 2 files changed, 7 deletions(-)"), {
+      files: 2,
+      lines: 7,
+    });
+  });
+
+  it("reports zero for an empty stat, which is what git prints for no diff", () => {
+    assert.deepEqual(parseShortstat(""), { files: 0, lines: 0 });
+    assert.deepEqual(parseShortstat(undefined), { files: 0, lines: 0 });
+  });
+
+  it("reports zero for text that is not a shortstat", () => {
+    assert.deepEqual(parseShortstat("fatal: bad revision"), { files: 0, lines: 0 });
   });
 });

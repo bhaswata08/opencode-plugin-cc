@@ -10,6 +10,7 @@ import path from "node:path";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
 import { isServerRunning, connect, resolveBackendName } from "./lib/backend.mjs";
+import { recentLoopVerdict } from "./lib/review-loop.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -21,6 +22,20 @@ async function main() {
   if (!state.config?.reviewGate) {
     // Gate is disabled, allow stop
     console.log("ALLOW: Review gate is disabled.");
+    return;
+  }
+
+  // A dispatch that already ran the reviewer -> coder loop has had this exact
+  // diff reviewed minutes ago. Reviewing it again here pays twice for one
+  // review, so the loop verdict stands and the gate steps aside — including
+  // when the loop ended badly, because in that case its own summary has
+  // already told the user what is still open.
+  const verdict = recentLoopVerdict(state.jobs);
+  if (verdict) {
+    console.log(
+      `ALLOW: review loop already ran (${verdict.status}, ` +
+        `${verdict.fixRounds} fix round(s), ${verdict.openFindings ?? 0} open).`,
+    );
     return;
   }
 

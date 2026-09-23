@@ -52,7 +52,8 @@ Flag handling (since 1.10.0-agy):
   into the prompt and run anyway, so a stripping mistake became the task text and
   spent quota on nothing. That mistake is now a loud failure instead of a silent
   one. The accepted flags are `--agent`, `--backend`, `--background`, `--fresh`,
-  `--model`, `--resume-last`, `--task-file`, `--wait`, `--write`.
+  `--model`, `--resume-last`, `--review-rounds`, `--task-file`,
+  `--wait`, `--write`.
 - Because of that, always put `--` between the flags and the prompt, on every
   dispatch, not only when the prompt might begin with a dash. Judging whether it
   might is one extra thing to get wrong, and a prompt like

@@ -108,3 +108,21 @@ export async function getUntrackedFiles(cwd) {
   );
   return stdout.trim().split("\n").filter(Boolean);
 }
+
+/**
+ * Parse `git diff --shortstat` into counts.
+ *
+ * The review loop's trigger floor needs a size, and shortstat is the cheapest
+ * way to get one: no diff body to read, and git prints nothing at all when
+ * there is no change, which is the case the caller most needs to recognise.
+ *
+ * @param {string|undefined} stat - e.g. " 3 files changed, 40 insertions(+), 2 deletions(-)"
+ * @returns {{files: number, lines: number}} lines is insertions + deletions
+ */
+export function parseShortstat(stat) {
+  const text = String(stat ?? "");
+  const files = Number(text.match(/(\d+)\s+files?\s+changed/)?.[1] ?? 0);
+  const inserted = Number(text.match(/(\d+)\s+insertions?\(\+\)/)?.[1] ?? 0);
+  const deleted = Number(text.match(/(\d+)\s+deletions?\(-\)/)?.[1] ?? 0);
+  return { files, lines: inserted + deleted };
+}
