@@ -19,6 +19,7 @@ import {
   parseModelsOutput,
   parsePrintResult,
   withAgyPolicy,
+  buildAgyPrompt,
   workspacePolicy,
   denyListPreflight,
   AGY_TOOL_POLICY,
@@ -924,12 +925,26 @@ describe("opencode sendPrompt model field (F5 invariant)", () => {
     assert.equal("model" in capture.body, false);
   });
 
-  it("includes the given model in the request body when --model is supplied", async () => {
+  it("sends the model as a providerID/modelID object when --model is supplied", async () => {
     const capture = {};
     installFetchCapture(capture);
     const client = opencodeCreateClient("http://127.0.0.1:4096");
-    await client.sendPrompt("sess-1", "hi", { model: "claude-x" });
-    assert.equal(capture.body.model, "claude-x");
+    await client.sendPrompt("sess-1", "hi", { model: "openrouter/meta/muse-spark-1.3-contributor" });
+    assert.deepEqual(capture.body.model, {
+      providerID: "openrouter",
+      modelID: "meta/muse-spark-1.3-contributor",
+    });
+  });
+
+  it("rejects a model without a provider prefix instead of sending a payload the server 400s", async () => {
+    const capture = {};
+    installFetchCapture(capture);
+    const client = opencodeCreateClient("http://127.0.0.1:4096");
+    await assert.rejects(
+      client.sendPrompt("sess-1", "hi", { model: "claude-x" }),
+      /provider\/model/,
+    );
+    assert.equal(capture.body, undefined, "no request must be sent with an unshapable model");
   });
 });
 
@@ -1305,3 +1320,58 @@ describe("agy process wait and grandchild pipe inheritance", () => {
   });
 });
 
+
+// ------------------------------------------------------------------
+// Seat prompts on agy
+//
+// agy has no agent files: agentToMode() maps a seat name to --mode and
+// discards everything else. buildAgyPrompt is what carries the seat's system
+// prompt across, now that the coder seat's default transport is agy.
+// ------------------------------------------------------------------
+
+describe("buildAgyPrompt", () => {
+  let seatTmp;
+  let seatPreviousXdg;
+
+  beforeEach(() => {
+    seatTmp = fs.mkdtempSync(path.join(os.tmpdir(), "agy-seat-"));
+    seatPreviousXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = seatTmp;
+    const dir = path.join(seatTmp, "opencode", "agent");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "coder.md"),
+      "---\nmodel: openrouter/x\n---\n\nYou are the implementation agent.\n",
+    );
+  });
+
+  afterEach(() => {
+    if (seatPreviousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = seatPreviousXdg;
+    fs.rmSync(seatTmp, { recursive: true, force: true });
+  });
+
+  it("carries the coder seat's system prompt, which agy would otherwise drop", () => {
+    const full = buildAgyPrompt("Fix the parser.", { agent: "coder" });
+    assert.match(full, /You are the implementation agent\./);
+    assert.match(full, /Fix the parser\./);
+  });
+
+  it("still appends the agy tool policy after the task text", () => {
+    const full = buildAgyPrompt("Fix the parser.", { agent: "coder" });
+    assert.ok(full.includes(AGY_TOOL_POLICY), "tool policy must survive");
+    assert.ok(
+      full.indexOf("You are the implementation agent.") < full.indexOf("Fix the parser."),
+      "seat prompt precedes the task",
+    );
+  });
+
+  it("adds nothing for a seat with no agent file", () => {
+    assert.equal(buildAgyPrompt("Fix it.", { agent: "build" }), withAgyPolicy("Fix it."));
+  });
+
+  it("is idempotent, so a fallback retry does not stack the seat prompt", () => {
+    const once = buildAgyPrompt("Fix the parser.", { agent: "coder" });
+    assert.equal(buildAgyPrompt(once, { agent: "coder" }), once);
+  });
+});

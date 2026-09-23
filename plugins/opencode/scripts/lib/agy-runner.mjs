@@ -75,6 +75,7 @@ import { getChangedFiles, getUntrackedFiles } from "./git.mjs";
 // transport emits the same line shapes. Re-exported here so existing
 // importers keep working without edits.
 import { formatToolDetail, formatProgressEvent } from "./progress.mjs";
+import { withSeatPrompt } from "./seat-prompt.mjs";
 
 export { formatToolDetail, formatProgressEvent };
 
@@ -198,6 +199,25 @@ export function withAgyPolicy(promptText, directory) {
   if (!promptText) return fullPolicy;
   if (promptText.includes(AGY_TOOL_POLICY)) return promptText;
   return `${promptText}\n\n${fullPolicy}`;
+}
+
+/**
+ * Assemble the full prompt for an agy run: the seat system prompt, the task,
+ * then the tool policy.
+ *
+ * agy has no agent files. agentToMode() turns a seat name into a --mode and
+ * discards the rest, so without this the coder seat runs with none of
+ * coder.md behind it - which matters now that agy is that seat default
+ * transport rather than its rare fallback. The frontmatter still cannot cross
+ * (agy takes its model from --model and has no variant or temperature flag);
+ * the prompt can.
+ *
+ * @param {string} promptText
+ * @param {{agent?: string, directory?: string}} [opts]
+ * @returns {string}
+ */
+export function buildAgyPrompt(promptText, opts = {}) {
+  return withAgyPolicy(withSeatPrompt(promptText, opts.agent), opts.directory);
 }
 
 // ---------------------------------------------------------------------------
@@ -789,7 +809,10 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
 
       if (directory) ensureWorkspaceGeminiignore(directory);
 
-      const fullPrompt = withAgyPolicy(promptText, directory);
+      const fullPrompt = buildAgyPrompt(promptText, {
+        agent: promptOpts.agent,
+        directory,
+      });
       const timeoutMs = Number(promptOpts.timeoutMs) || printTimeoutMs();
       const args = buildPrintArgs(fullPrompt, {
         model: promptOpts.model,

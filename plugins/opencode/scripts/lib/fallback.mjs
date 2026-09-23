@@ -25,10 +25,11 @@ import { readAgySettings } from "./agy-runner.mjs";
  * cannot spawn a Claude Code subagent.
  */
 export const FALLBACKS = {
-  // muse spark is free only while opencode's contributor tier lasts. gemini
-  // through agy runs on an account that is paid for, so it is the seat that
-  // survives the free tier going away.
-  coder: { backend: "agy", model: "gemini-3.8-flash-high" },
+  // gemini through agy is coder's primary now (see SEAT_DEFAULTS below), on an
+  // account that is paid for. muse spark via opencode's own router is the
+  // fallback: it survives an agy outage or quota exhaustion even though it is
+  // the seat that used to be primary.
+  coder: { backend: "opencode", model: "openrouter/meta/muse-spark-1.3-contributor" },
   // "build" is opencode's built-in write agent, not the coder seat: it carries
   // none of coder.md's model, variant, temperature, or system prompt. It is mapped
   // here only so a dispatch that reached build anyway still falls back somewhere
@@ -43,6 +44,17 @@ export const FALLBACKS = {
 };
 
 /**
+ * Primary backend + model for a seat when the caller pins neither. Only seats
+ * that need to leave opencode's own default transport belong here; everything
+ * else resolves through OPENCODE_BACKEND / resolveBackendName() as before.
+ */
+export const SEAT_DEFAULTS = {
+  // agy/gemini is the paid, durable route; see the note on FALLBACKS.coder
+  // for what it falls back to when agy cannot be reached.
+  coder: { backend: "agy", model: "gemini-3.8-flash-high" },
+};
+
+/**
  * Look up the fallback for an agent seat.
  * @param {string|undefined} agent
  * @returns {{backend?: string, agent?: string, model?: string, handoff?: string}|null}
@@ -50,6 +62,17 @@ export const FALLBACKS = {
 export function resolveFallback(agent) {
   if (!agent) return null;
   return FALLBACKS[String(agent).trim().toLowerCase()] ?? null;
+}
+
+/**
+ * Look up the seat default for an agent, honored only when the caller did not
+ * pin a backend explicitly.
+ * @param {string|undefined} agent
+ * @returns {{backend: string, model?: string}|null}
+ */
+export function resolveSeatDefault(agent) {
+  if (!agent) return null;
+  return SEAT_DEFAULTS[String(agent).trim().toLowerCase()] ?? null;
 }
 
 // Failures that mean "this model was not reachable". Matched against the error
@@ -64,13 +87,16 @@ const TRANSPORT_PATTERNS = [
   /spawn\s+\S+\s+ENOENT/i,
   /\bEACCES\b/i,
   // provider said no: auth, quota, overload, or the model does not exist
-  /returned\s+(401|403|404|408|409|429|5\d\d)\b/,
+  /returned\s+(401|403|404|408|409|410|429|5\d\d)\b/,
   /\b(401|403|429|500|502|503|504)\b.*\b(unauthorized|forbidden|rate|quota|overloaded|unavailable|internal)\b/i,
   /rate[\s_-]?limit/i,
   /\bquota\b/i,
   /overloaded/i,
   /model[^.]{0,40}\b(not found|unavailable|unsupported|does not exist|unknown)\b/i,
   /no such model/i,
+  // retired model: the provider reports end-of-life and refuses to serve it
+  /end of life/i,
+  /no longer available/i,
   // timeouts: prompt-level deadline or session stall
   /prompt timeout/i,
   /session idle/i,

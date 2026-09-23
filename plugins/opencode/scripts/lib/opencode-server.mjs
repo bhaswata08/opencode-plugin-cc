@@ -312,6 +312,66 @@ export async function ensureServer(opts = {}) {
 }
 
 /**
+ * Parse a "provider/model" string into the object shape
+ * POST /session/:id/message expects for its `model` field.
+ *
+ * The server rejects a bare string with
+ *   400 {"name":"BadRequest","data":{"message":"Expected object | null, got ...","kind":"Payload"}}
+ * so split on the FIRST "/" only: everything before it is the providerID,
+ * everything after (slashes included) is the modelID.
+ *
+ * @param {string|object} model - e.g. "openrouter/meta/muse-spark-1.3-contributor"
+ * @returns {{providerID: string, modelID: string}}
+ * @throws {Error} when the string has no "/" and cannot be shaped.
+ */
+export function parseModelString(model) {
+  if (model && typeof model === "object") {
+    if (model.providerID && model.modelID) return model;
+  }
+  if (typeof model !== "string") {
+    throw new Error(
+      `Invalid model ${JSON.stringify(model)}: expected "provider/model" form (e.g. "openrouter/meta/muse-spark-1.3-contributor")`,
+    );
+  }
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    throw new Error(
+      `Invalid model "${model}": expected "provider/model" form (e.g. "openrouter/meta/muse-spark-1.3-contributor")`,
+    );
+  }
+  return {
+    providerID: model.slice(0, slash),
+    modelID: model.slice(slash + 1),
+  };
+}
+
+/**
+ * Request-level rejections from POST /session/:id/message: the server
+ * refused the request itself (bad payload, bad auth, unknown session,
+ * unprocessable), so the prompt never ran and no message was ever created.
+ * Deliberately excludes the server's ~5min POST cap (a socket-level
+ * "fetch failed", not a status) and 5xx (the prompt may still be running).
+ */
+const REQUEST_REJECTED_STATUSES = new Set([400, 401, 403, 404, 422]);
+
+/**
+ * Did the POST fail because the request itself was rejected?
+ * Reads the status kept on the thrown error, falling back to the
+ * `OpenCode prompt failed <status>` / `returned <status>` message shape.
+ * @param {any} err
+ * @returns {boolean}
+ */
+export function isRequestRejected(err) {
+  if (!err) return false;
+  const status = Number(
+    err.status ?? err.statusCode ?? err.cause?.status ?? err.cause?.statusCode ?? NaN,
+  );
+  if (REQUEST_REJECTED_STATUSES.has(status)) return true;
+  const m = String(err.message ?? err).match(/(?:failed|returned)\s+(\d{3})\b/);
+  return m ? REQUEST_REJECTED_STATUSES.has(Number(m[1])) : false;
+}
+
+/**
  * Create an API client bound to a running OpenCode server.
  * @param {string} baseUrl
  * @param {object} [opts]
@@ -405,7 +465,7 @@ export function createClient(baseUrl, opts = {}) {
         parts: [{ type: "text", text: promptText }],
       };
       if (opts.agent) body.agent = opts.agent;
-      if (opts.model) body.model = opts.model;
+      if (opts.model) body.model = parseModelString(opts.model);
       if (opts.system) body.system = opts.system;
 
       const ac = new AbortController();
@@ -455,7 +515,9 @@ export function createClient(baseUrl, opts = {}) {
         });
         if (!res.ok) {
           const text = await res.text().catch(() => "");
-          throw new Error(`OpenCode prompt failed ${res.status}: ${text}`);
+          const err = new Error(`OpenCode prompt failed ${res.status}: ${text}`);
+          err.status = res.status;
+          throw err;
         }
         return { source: "fetch", data: await res.json() };
       })();
@@ -663,6 +725,21 @@ export function createClient(baseUrl, opts = {}) {
         // Do NOT abort yet: in particular, the watcher needs to keep polling
         // when the POST was killed by the server's 5-min cap but generation
         // is still running.
+        // Exception: the POST was rejected at the request level (400/401/403/
+        // 404/422). The prompt never ran and no message was ever created, so
+        // the watcher would poll an empty session until the idle timeout.
+        // Abort it and surface the POST error immediately.
+        if (!first.ok && first.via === "fetch" && isRequestRejected(first.err)) {
+          ac.abort(first.err);
+          fetchPromise.catch(() => {});
+          watcherPromise.catch(() => {});
+          throw classifyError(first.err, {
+            baseUrl,
+            startedAt,
+            timeoutMs: PROMPT_TIMEOUT_MS,
+            op: "sendPrompt",
+          });
+        }
         const second = first.via === "fetch" ? await runWatcher : await runFetch;
         ac.abort();
         fetchPromise.catch(() => {});
@@ -700,7 +777,7 @@ export function createClient(baseUrl, opts = {}) {
         parts: [{ type: "text", text: promptText }],
       };
       if (opts.agent) body.agent = opts.agent;
-      if (opts.model) body.model = opts.model;
+      if (opts.model) body.model = parseModelString(opts.model);
       return request("POST", `/session/${sessionId}/prompt_async`, body);
     },
 
@@ -739,6 +816,8 @@ export async function connect(opts = {}) {
 
 export const __test = {
   detectQuotaNotice,
+  parseModelString,
+  isRequestRejected,
   countChildren,
   resolveServePid,
   IDLE_TIMEOUT_MS,

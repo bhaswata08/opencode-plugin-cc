@@ -74,5 +74,7 @@ function annotate(err, hint) {
   const wrapped = new Error(`${hint} [${err.message}]`);
   wrapped.cause = err;
   wrapped.code = err.code;
+  if (err.status !== undefined) wrapped.status = err.status;
+  if (err.statusCode !== undefined) wrapped.statusCode = err.statusCode;
   return wrapped;
 }

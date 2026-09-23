@@ -6,6 +6,7 @@ import os from "node:os";
 import {
   FALLBACKS,
   resolveFallback,
+  resolveSeatDefault,
   isTransportFailure,
   isEmptyResult,
   fallbackBlockedReason,
@@ -17,25 +18,36 @@ import {
   parseOpencodeLogError,
   readOpencodeLogError,
   resolveOpencodeLogPath,
+  parseModelString,
+  isRequestRejected,
   __test,
 } from "../plugins/opencode/scripts/lib/opencode-server.mjs";
 
 test("every seat the user configured has a fallback", () => {
-  assert.equal(FALLBACKS.coder.backend, "agy");
-  assert.equal(FALLBACKS.coder.model, "gemini-3.8-flash-high");
+  assert.equal(FALLBACKS.coder.backend, "opencode");
+  assert.equal(FALLBACKS.coder.model, "openrouter/meta/muse-spark-1.3-contributor");
   assert.equal(FALLBACKS.reviewer.handoff, "claude-subagent");
   assert.equal(FALLBACKS.reviewer.model, "sonnet");
   assert.equal(FALLBACKS.adversary.agent, "adversary-fallback");
 });
 
-test("build resolves to the same fallback as coder", () => {
-  assert.deepEqual(resolveFallback("build"), resolveFallback("coder"));
+test("build keeps its own agy fallback, independent of coder's", () => {
+  assert.equal(FALLBACKS.build.backend, "agy");
+  assert.equal(FALLBACKS.build.model, "gemini-3.8-flash-high");
+  assert.notDeepEqual(resolveFallback("build"), resolveFallback("coder"));
 });
 
 test("resolveFallback is case-insensitive and safe on unknown seats", () => {
-  assert.equal(resolveFallback("CODER").backend, "agy");
+  assert.equal(resolveFallback("CODER").backend, "opencode");
   assert.equal(resolveFallback("nonesuch"), null);
   assert.equal(resolveFallback(undefined), null);
+});
+
+test("coder's primary seat default is agy, gemini-3.8-flash-high", () => {
+  assert.equal(resolveSeatDefault("coder").backend, "agy");
+  assert.equal(resolveSeatDefault("coder").model, "gemini-3.8-flash-high");
+  assert.equal(resolveSeatDefault("build"), null, "build is not the coder seat");
+  assert.equal(resolveSeatDefault("reviewer"), null);
 });
 
 test("transport failures are recognised", () => {
@@ -120,15 +132,15 @@ test("a bad result is rethrown without a second model running", async () => {
   assert.equal(calls, 1, "the fallback must not run on a real result");
 });
 
-test("a transport failure switches backend and model for the retry", async () => {
+test("a transport failure switches model for the retry", async () => {
   const seen = [];
   const out = await runWithFallback({
     agent: "coder",
     attempt: async (sel) => {
       seen.push({
         agent: sel.agent,
+        model: sel.model,
         backend: process.env.OPENCODE_BACKEND,
-        agyModel: process.env.AGY_MODEL,
       });
       if (seen.length === 1) throw new Error("connect ECONNREFUSED 127.0.0.1:4096");
       return { text: "recovered", value: "recovered" };
@@ -136,8 +148,8 @@ test("a transport failure switches backend and model for the retry", async () =>
   });
   assert.equal(out.value, "recovered");
   assert.equal(out.usedFallback, true);
-  assert.equal(seen[1].backend, "agy");
-  assert.equal(seen[1].agyModel, "gemini-3.8-flash-high");
+  assert.equal(seen[1].backend, "opencode");
+  assert.equal(seen[1].model, "openrouter/meta/muse-spark-1.3-contributor");
 });
 
 test("a transport failure re-resolves transport and mints fresh session on fallback backend", async () => {
@@ -168,7 +180,7 @@ test("a transport failure re-resolves transport and mints fresh session on fallb
   };
 
   const out = await runWithFallback({
-    agent: "coder",
+    agent: "build",
     backend: "opencode",
     connect,
     attempt: async (sel, ctx) => {
@@ -199,9 +211,9 @@ test("a transport failure re-resolves transport and mints fresh session on fallb
 test("the environment is restored after a fallback runs", async () => {
   const before = process.env.OPENCODE_BACKEND;
   await runWithFallback({
-    agent: "coder",
+    agent: "build",
     attempt: async (sel) => {
-      if (sel.agent === "coder" && process.env.OPENCODE_BACKEND !== "agy") {
+      if (sel.agent === "build" && process.env.OPENCODE_BACKEND !== "agy") {
         throw new Error("fetch failed");
       }
       return { text: "ok", value: "ok" };
@@ -749,7 +761,7 @@ test("a fallback onto the target the primary just exhausted is refused", async (
   try {
     await assert.rejects(
       runWithFallback({
-        agent: "coder",
+        agent: "build",
         model: "gemini-3.8-flash-high",
         backend: "agy",
         attempt: async (opts) => {
@@ -795,4 +807,113 @@ test("isExhaustionFailure separates no-allowance from unreachable", async () => 
   assert.ok(isExhaustionFailure(new Error("Individual quota reached.")));
   assert.ok(!isExhaustionFailure(new Error("fetch failed")));
   assert.ok(!isExhaustionFailure(new Error("session idle timeout: 601s > 600s")));
+});
+
+test("parseModelString splits on the first slash only", () => {
+  assert.deepEqual(parseModelString("openrouter/meta/muse-spark-1.3-contributor"), {
+    providerID: "openrouter",
+    modelID: "meta/muse-spark-1.3-contributor",
+  });
+  assert.deepEqual(parseModelString("openrouter/claude-x"), {
+    providerID: "openrouter",
+    modelID: "claude-x",
+  });
+});
+
+test("parseModelString throws on a model with no provider prefix", () => {
+  assert.throws(() => parseModelString("claude-x"), /provider\/model/);
+  assert.throws(() => parseModelString("openrouter/"), /provider\/model/);
+  assert.throws(() => parseModelString(""), /provider\/model/);
+});
+
+test("a retired model (410 Gone / end of life) is a transport failure", () => {
+  const gone = new Error(
+    "410 Gone: {\"type\":\"about:blank\",\"title\":\"Gone\",\"status\":410," +
+    "\"detail\":\"The model 'qwen/qwen3-next-80b-a3b-instruct' has reached its " +
+    "end of life on 2026-07-27T00:00:00Z and is no longer available.\"}",
+  );
+  assert.equal(isTransportFailure(gone), true, "410 Gone must trigger the fallback");
+  assert.equal(
+    isTransportFailure(new Error("OpenCode API POST /session returned 410: Gone")),
+    true,
+    "returned 410 must trigger the fallback",
+  );
+  assert.equal(
+    isTransportFailure(new Error("The model 'qwen/qwen3-next-80b-a3b-instruct' has reached its end of life")),
+    true,
+    "end of life wording must trigger the fallback",
+  );
+  assert.equal(
+    isTransportFailure(new Error("The model is no longer available")),
+    true,
+    "no longer available wording must trigger the fallback",
+  );
+});
+
+test("a request-level 4xx from the POST rejects fast instead of polling the empty session", async () => {
+  const originalFetch = global.fetch;
+  const originalDelay = process.env.OPENCODE_MIN_POLL_DELAY_MS;
+  const originalInterval = process.env.OPENCODE_COMPLETION_POLL_MS;
+  const originalLogPath = process.env.OPENCODE_LOG_PATH;
+  process.env.OPENCODE_MIN_POLL_DELAY_MS = "10";
+  process.env.OPENCODE_COMPLETION_POLL_MS = "10";
+  // A missing log path resolves to "no error" immediately, so the watcher
+  // would only exit via the idle timeout if it were left running.
+  process.env.OPENCODE_LOG_PATH = "/path/to/definitely/nonexistent/opencode-test.log";
+
+  let getPolls = 0;
+  try {
+    global.fetch = async (url, init) => {
+      const u = String(url);
+      if (init?.method === "POST" && u.endsWith("/message")) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => '{"name":"BadRequest","data":{"message":"Expected object | null","kind":"Payload"}}',
+        };
+      }
+      if (u.includes("/message?limit=1")) {
+        getPolls++;
+        return { ok: true, json: async () => [] };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    const client = createClient("http://127.0.0.1:4096");
+    const startedAt = Date.now();
+    let caughtErr = null;
+    try {
+      await client.sendPrompt("sess-400-1", "test prompt");
+    } catch (err) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, "expected sendPrompt to reject on a 400 POST");
+    assert.match(caughtErr.message, /OpenCode prompt failed 400/);
+    assert.ok(
+      Date.now() - startedAt < 30_000,
+      `must reject fast, not wait out the idle timeout (took ${Date.now() - startedAt}ms)`,
+    );
+    assert.ok(getPolls <= 2, `watcher must be aborted, not left polling (saw ${getPolls} polls)`);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalDelay !== undefined) process.env.OPENCODE_MIN_POLL_DELAY_MS = originalDelay;
+    else delete process.env.OPENCODE_MIN_POLL_DELAY_MS;
+    if (originalInterval !== undefined) process.env.OPENCODE_COMPLETION_POLL_MS = originalInterval;
+    else delete process.env.OPENCODE_COMPLETION_POLL_MS;
+    if (originalLogPath !== undefined) process.env.OPENCODE_LOG_PATH = originalLogPath;
+    else delete process.env.OPENCODE_LOG_PATH;
+  }
+});
+
+test("isRequestRejected only matches request-level 4xx, not the 5-minute cap or 5xx", () => {
+  assert.equal(isRequestRejected(Object.assign(new Error("OpenCode prompt failed 400: bad"), { status: 400 })), true);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 401: auth")), true);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 403: forbidden")), true);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 404: no session")), true);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 422: unprocessable")), true);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 500: boom")), false);
+  assert.equal(isRequestRejected(new Error("OpenCode prompt failed 429: slow down")), false);
+  assert.equal(isRequestRejected(new Error("fetch failed")), false);
+  assert.equal(isRequestRejected(null), false);
 });
