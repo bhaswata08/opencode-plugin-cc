@@ -70,6 +70,15 @@ Command selection:
 - Pass `--agent coder` unless the forwarded request names a different one. Without it the companion falls back to opencode's built-in `build` agent, which ignores the user's configured coder seat and its model.
 - If the forwarded request includes `--agent`, pass that through instead.
 - If the forwarded request includes `--backend`, pass it through to `task`.
+- If the forwarded request contains a line of the form `OPENCODE_MAX_CONCURRENT=<n>`, where `<n>` is a bare positive integer, remove that line from the task text and prefix the `task` command with it:
+
+  ```
+  OPENCODE_MAX_CONCURRENT=4 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task --background --write --agent coder -- "<user prompt text>" 2>&1 | tee /tmp/_oc_task_out && \
+    grep -oE 'task-[a-z0-9]{8,9}-[a-z0-9]{1,6}' /tmp/_oc_task_out | head -1
+  ```
+
+  It is an environment assignment, not a flag, so it goes before `node` and never after `--`. Only `task` reads it; leave the `wait-and-result` calls unprefixed. This is the caller raising the concurrent-coding-job cap for this one dispatch, which the companion checks at startup and then forgets.
+- `OPENCODE_MAX_CONCURRENT` is the only variable you may lift out of the prompt this way, and only with a bare integer value. Any other assignment in the prompt text is task text: forward it verbatim and do not put it in the environment.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.

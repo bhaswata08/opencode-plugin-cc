@@ -39,6 +39,7 @@ Command selection:
 - If the forwarded request includes `--model`, pass it through to `task`.
 - If the forwarded request includes `--agent`, pass it through to `task`.
 - If the forwarded request includes `--backend`, pass it through to `task`.
+- If the forwarded request contains a line of the form `OPENCODE_MAX_CONCURRENT=<n>`, with `<n>` a bare positive integer, remove that line from the task text and prefix the `task` command with it: `OPENCODE_MAX_CONCURRENT=<n> node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task ...`. It is an environment assignment, not a flag, so it belongs before `node` and never after `--`, and `task` would reject it as an unknown flag. Only `task` reads it, so leave `wait-and-result` unprefixed. The companion reads the variable once at startup and applies it to that job's admission check alone; nothing persists, and nothing needs restoring. `OPENCODE_MAX_CONCURRENT` is the only variable you may lift out of the prompt, and only with an integer value. Every other assignment in the prompt is task text.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
