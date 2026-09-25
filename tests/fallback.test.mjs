@@ -73,6 +73,8 @@ test("transport failures are recognised", () => {
     new Error("opencode stream stalled: no tokens and no parts after 90s (provider likely rate limited)"),
     new Error("opencode stream stalled: no tokens and no parts after 90s"),
     new Error("Rate limit exceeded. Please try again later."),
+    new Error("Too Many Requests"),
+    new Error("AI_APICallError: Too Many Requests"),
   ];
   for (const err of yes) {
     assert.equal(isTransportFailure(err), true, `should be transport: ${err.message}`);
@@ -805,6 +807,7 @@ test("isExhaustionFailure separates no-allowance from unreachable", async () => 
   );
   assert.ok(isExhaustionFailure(new Error("Rate limit exceeded. Try again later.")));
   assert.ok(isExhaustionFailure(new Error("Individual quota reached.")));
+  assert.ok(isExhaustionFailure(new Error("Too Many Requests")));
   assert.ok(!isExhaustionFailure(new Error("fetch failed")));
   assert.ok(!isExhaustionFailure(new Error("session idle timeout: 601s > 600s")));
 });

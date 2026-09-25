@@ -91,6 +91,9 @@ const TRANSPORT_PATTERNS = [
   /\b(401|403|429|500|502|503|504)\b.*\b(unauthorized|forbidden|rate|quota|overloaded|unavailable|internal)\b/i,
   /rate[\s_-]?limit/i,
   /\bquota\b/i,
+  // HTTP 429's reason phrase. The AI SDK's AI_APICallError carries only the
+  // status text, so synthetic's 429 arrives as "Too Many Requests" with no code.
+  /too many requests/i,
   /overloaded/i,
   /model[^.]{0,40}\b(not found|unavailable|unsupported|does not exist|unknown)\b/i,
   /no such model/i,
@@ -116,6 +119,7 @@ const EXHAUSTION_PATTERNS = [
   /\bquota\b/i,
   /\b429\b/,
   /returned\s+429\b/,
+  /too many requests/i,
 ];
 
 /**
