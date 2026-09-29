@@ -308,11 +308,11 @@ async function handleAdversarialReview(argv) {
 const CODING_AGENTS = new Set(["coder", "build"]);
 
 // Ceiling on coding jobs in flight at once, across every workspace on this
-// machine. Two is deliberate. A six-way fan-out drained a five-hour provider
-// window in thirty-five minutes, and roughly half of that overlap came from
-// separate Claude Code sessions in the same repo, so no per-session rule can
-// see it. Set OPENCODE_MAX_CONCURRENT to raise it for a run that needs more.
-const MAX_CONCURRENT_CODING = Number(process.env.OPENCODE_MAX_CONCURRENT) || 2;
+// machine. A six-way fan-out once drained a five-hour provider window in
+// thirty-five minutes, and roughly half of that overlap came from separate
+// Claude Code sessions in the same repo, so no per-session rule can see it.
+// Set OPENCODE_MAX_CONCURRENT to override this for a single run.
+const MAX_CONCURRENT_CODING = Number(process.env.OPENCODE_MAX_CONCURRENT) || 6;
 
 /**
  * Message explaining why this job may not start, or null when it may.
