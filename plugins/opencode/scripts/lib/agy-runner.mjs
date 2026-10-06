@@ -65,7 +65,7 @@
 // denied by the allow-list, failing the run. The workspace policy text below
 // states the absolute root directly instead and never uses that phrasing.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -78,6 +78,8 @@ import { formatToolDetail, formatProgressEvent } from "./progress.mjs";
 import { withSeatPrompt } from "./seat-prompt.mjs";
 
 export { formatToolDetail, formatProgressEvent };
+
+const IS_WINDOWS = process.platform === "win32";
 
 // ---------------------------------------------------------------------------
 // Env conventions (mirror the OPENCODE_*_TIMEOUT_MS pattern)
@@ -106,13 +108,59 @@ function needsWindowsShell(bin) {
 // Absolute safety cap for one --print invocation. Defaults to the opencode
 // prompt cap so both backends share one knob; AGY_PRINT_TIMEOUT_MS overrides
 // per-backend. Passed to agy as --print-timeout AND enforced client-side by
-// killing the child, so a stuck agy cannot hang the worker past this.
-function printTimeoutMs() {
+// killing the child. The wall-clock cap is now a loose backstop; the idle
+// watchdog is the stall detector.
+function printTimeoutMs(opts = {}) {
+  if (opts.timeoutMs !== undefined) {
+    const v = Number(opts.timeoutMs);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
   const v = Number(process.env.AGY_PRINT_TIMEOUT_MS);
   if (Number.isFinite(v) && v > 0) return v;
   const fallback = Number(process.env.OPENCODE_PROMPT_TIMEOUT_MS);
   if (Number.isFinite(fallback) && fallback > 0) return fallback;
   return 14_400_000;
+}
+
+// Idle timeout for an agy run: how long without ANY stream output before
+// we consider the run wedged. AGY_IDLE_TIMEOUT_MS overrides; falls back to
+// OPENCODE_IDLE_TIMEOUT_MS; defaults to 10 minutes (600_000 ms).
+// A value of 0 or non-finite disables the idle watchdog.
+function idleTimeoutMs(opts = {}) {
+  if (opts.idleTimeoutMs !== undefined) {
+    const v = Number(opts.idleTimeoutMs);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+  if (process.env.AGY_IDLE_TIMEOUT_MS !== undefined) {
+    const v = Number(process.env.AGY_IDLE_TIMEOUT_MS);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+  if (process.env.OPENCODE_IDLE_TIMEOUT_MS !== undefined) {
+    const v = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+  return 600_000;
+}
+
+// Maximum consecutive idle extensions granted when agy has live descendant
+// processes. Prevents a child process (e.g. build, tests) from suppressing
+// the idle timeout forever while giving long tool commands headroom.
+// AGY_MAX_IDLE_EXTENSIONS overrides; falls back to OPENCODE_MAX_IDLE_EXTENSIONS;
+// defaults to 2. A value of 0 disables extensions.
+function maxIdleExtensions(opts = {}) {
+  if (opts.maxIdleExtensions !== undefined) {
+    const v = Number(opts.maxIdleExtensions);
+    return Number.isFinite(v) && v >= 0 ? v : 0;
+  }
+  if (process.env.AGY_MAX_IDLE_EXTENSIONS !== undefined) {
+    const v = Number(process.env.AGY_MAX_IDLE_EXTENSIONS);
+    return Number.isFinite(v) && v >= 0 ? v : 0;
+  }
+  if (process.env.OPENCODE_MAX_IDLE_EXTENSIONS !== undefined) {
+    const v = Number(process.env.OPENCODE_MAX_IDLE_EXTENSIONS);
+    return Number.isFinite(v) && v >= 0 ? v : 0;
+  }
+  return 2;
 }
 
 function defaultModel() {
@@ -506,6 +554,84 @@ function authTokenPresent() {
 
 export const EXIT_DRAIN_GRACE_MS = 500;
 
+/**
+ * Count descendant child processes of `pid`. Returns:
+ *   -1 — feature unavailable (Windows, pgrep missing, etc.) — caller should skip check
+ *    0 — no children
+ *   >0 — that many children
+ */
+export function countChildren(pid) {
+  if (!pid || IS_WINDOWS) return -1;
+  try {
+    const queue = [String(pid)];
+    const visited = new Set([String(pid)]);
+    let total = 0;
+    while (queue.length > 0) {
+      const parent = queue.shift();
+      const r = spawnSync("pgrep", ["-P", parent], {
+        encoding: "utf8",
+        timeout: 2000,
+      });
+      if (r.error) return total > 0 ? total : -1;
+      const out = (r.stdout || "").trim();
+      if (!out) continue;
+      const pids = out.split("\n").map((l) => l.trim()).filter(Boolean);
+      for (const childPid of pids) {
+        if (!visited.has(childPid)) {
+          visited.add(childPid);
+          queue.push(childPid);
+          total++;
+        }
+      }
+    }
+    return total;
+  } catch {
+    return -1;
+  }
+}
+
+export function killWithEscalation(proc, onHardKill = null) {
+  try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+  // Escalate so a wedged child cannot outlive the timeout. Unref'd:
+  // the primary close/error handlers below already settle the wait.
+  const esc = setTimeout(() => {
+    try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+    if (onHardKill) {
+      const hard = setTimeout(onHardKill, 2_000);
+      hard.unref?.();
+    }
+  }, 10_000);
+  esc.unref?.();
+  return () => clearTimeout(esc);
+}
+
+export function formatTimeoutDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return "0ms";
+  if (n >= 3_600_000 && n % 3_600_000 === 0) {
+    return `${n / 3_600_000}h`;
+  }
+  if (n >= 60_000 && n % 60_000 === 0) {
+    return `${n / 60_000}m`;
+  }
+  if (n >= 1000 && n % 1000 === 0) {
+    return `${n / 1000}s`;
+  }
+  if (n >= 3_600_000) {
+    const hours = (n / 3_600_000).toFixed(1).replace(/\.0$/, "");
+    return `${hours}h`;
+  }
+  if (n >= 60_000) {
+    const mins = (n / 60_000).toFixed(1).replace(/\.0$/, "");
+    return `${mins}m`;
+  }
+  if (n >= 1000) {
+    const secs = (n / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${secs}s`;
+  }
+  return `${n}ms`;
+}
+
 export function waitForProcess(proc, {
   timeoutMs = printTimeoutMs(),
   graceMs = EXIT_DRAIN_GRACE_MS,
@@ -533,19 +659,8 @@ export function waitForProcess(proc, {
 
     if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
       timer = setTimeout(() => {
-        if (onTimeout) {
-          onTimeout();
-        } else {
-          try { proc.kill("SIGTERM"); } catch { /* already gone */ }
-          // Escalate so a wedged child cannot outlive the timeout. Unref'd:
-          // the primary close/error handlers below already settle the wait.
-          const esc = setTimeout(() => {
-            try { proc.kill("SIGKILL"); } catch { /* already gone */ }
-            const hard = setTimeout(() => settle(1), 2_000);
-            hard.unref?.();
-          }, 10_000);
-          esc.unref?.();
-        }
+        try { onTimeout?.(); } catch {}
+        killWithEscalation(proc, () => settle(1));
       }, timeoutMs);
     }
 
@@ -762,6 +877,27 @@ function toFailure(data, stderrText, learnedCid) {
   return err;
 }
 
+export function makeTimeoutError({ type, durationMs, stderr = "", conversationId = null }) {
+  let msg;
+  if (type === "IDLE_TIMEOUT") {
+    msg = `agy run killed after ${formatTimeoutDuration(durationMs)} with no stream activity (AGY_IDLE_TIMEOUT_MS=${durationMs})`;
+  } else {
+    msg = `agy run hit the wall-clock cap of ${formatTimeoutDuration(durationMs)} (AGY_PRINT_TIMEOUT_MS=${durationMs})`;
+  }
+  if (conversationId) {
+    msg += ` [conversation ${conversationId}]`;
+  }
+  if (stderr && stderr.trim()) {
+    msg += ` [stderr: ${tailLines(stderr, 5).slice(0, 500)}]`;
+  }
+  const err = new Error(msg);
+  err.agyStatus = type;
+  if (conversationId) {
+    err.conversationId = conversationId;
+  }
+  return err;
+}
+
 /**
  * Create an agy client. Accepts (opts) or (baseUrl, opts) so the shared
  * backend.mjs dispatcher can forward opencode-shaped call sites unchanged;
@@ -814,6 +950,8 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
         directory,
       });
       const timeoutMs = Number(promptOpts.timeoutMs) || printTimeoutMs();
+      const idleTimeout = idleTimeoutMs(promptOpts);
+      const maxExtensions = maxIdleExtensions(promptOpts);
       const args = buildPrintArgs(fullPrompt, {
         model: promptOpts.model,
         effort: promptOpts.effort,
@@ -842,7 +980,50 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
       const seenSteps = new Set();
       const progressCb = promptOpts.onProgress ?? promptOpts.log ?? defaultOnProgress;
 
+      let killedBy = null;
+      let lastActivity = Date.now();
+      let idleExtensionsUsed = 0;
+      let idleTimer = null;
+
+      function checkIdle() {
+        if (killedBy) return;
+        const now = Date.now();
+        const timeSinceActivity = now - lastActivity;
+        if (timeSinceActivity < idleTimeout) {
+          const remaining = Math.max(1, idleTimeout - timeSinceActivity);
+          idleTimer = setTimeout(checkIdle, remaining);
+          idleTimer.unref?.();
+          return;
+        }
+
+        const rawChildren = countChildren(proc.pid);
+        const liveChildren = Math.max(0, rawChildren);
+        if (liveChildren > 0 && idleExtensionsUsed < maxExtensions) {
+          idleExtensionsUsed++;
+          lastActivity = Date.now();
+          const quietSec = Math.max(1, Math.floor(timeSinceActivity / 1000));
+          const msg = `agy idle watchdog: quiet for ${quietSec}s, but child process(es) alive (${liveChildren}); idle extension ${idleExtensionsUsed}/${maxExtensions}`;
+          if (progressCb) {
+            try { progressCb(msg); } catch {}
+          }
+          idleTimer = setTimeout(checkIdle, idleTimeout);
+          idleTimer.unref?.();
+        } else {
+          killedBy = "IDLE_TIMEOUT";
+          killWithEscalation(proc);
+        }
+      }
+
+      if (idleTimeout > 0) {
+        idleTimer = setTimeout(checkIdle, idleTimeout);
+        idleTimer.unref?.();
+      }
+
       proc.stdout.on("data", (chunk) => {
+        lastActivity = Date.now();
+        // Extensions are per quiet stretch, not per run: a long job may run
+        // many slow commands, and each one gets the full allowance.
+        idleExtensionsUsed = 0;
         const str = chunk.toString();
         stdout += str;
         stdoutBuffer += str;
@@ -873,9 +1054,21 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
           }
         }
       });
-      proc.stderr.on("data", (d) => (stderr += d));
+      proc.stderr.on("data", (d) => {
+        lastActivity = Date.now();
+        stderr += d;
+      });
 
-      const exitCode = await waitForProcess(proc, { timeoutMs });
+      const exitCode = await waitForProcess(proc, {
+        timeoutMs,
+        onTimeout: () => {
+          if (!killedBy) killedBy = "PRINT_TIMEOUT";
+        },
+      });
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
       untrack(entry);
 
       // Process any trailing buffered line after process exit
@@ -898,13 +1091,43 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
         }
       }
 
+      let parsedData = null;
+      try {
+        parsedData = parsePrintResult(stdout);
+        if (parsedData?.conversation_id && !learnedConversationId) {
+          learnedConversationId = parsedData.conversation_id;
+        }
+      } catch {}
+
+      // agy's own --print-timeout firing produces "error: interrupted"
+      const elapsed = Date.now() - startedAt;
+      const isNearWallClock = timeoutMs >= 10_000
+        ? elapsed >= timeoutMs - 5_000
+        : elapsed >= timeoutMs * 0.7;
+
+      const hasInterrupted =
+        /error:\s*interrupted/i.test(stderr) ||
+        /^\s*interrupted\s*$/i.test(stderr) ||
+        (parsedData && typeof parsedData.error === "string" && /interrupted/i.test(parsedData.error));
+
+      if (!killedBy && isNearWallClock && hasInterrupted) {
+        killedBy = "PRINT_TIMEOUT";
+      }
+
+      if (killedBy) {
+        const durationMs = killedBy === "IDLE_TIMEOUT" ? idleTimeout : timeoutMs;
+        throw makeTimeoutError({
+          type: killedBy,
+          durationMs,
+          stderr,
+          conversationId: learnedConversationId,
+        });
+      }
+
       if (exitCode !== 0 && !stdout.trim()) {
         const err = new Error(
           `agy exited ${exitCode} with no output` +
-            (stderr.trim() ? `: ${tailLines(stderr, 5).slice(0, 500)}` : "") +
-            (Date.now() - startedAt >= timeoutMs
-              ? ` (AGY_PRINT_TIMEOUT_MS=${timeoutMs})`
-              : ""),
+            (stderr.trim() ? `: ${tailLines(stderr, 5).slice(0, 500)}` : ""),
         );
         err.agyStatus = "EXIT_NONZERO";
         if (learnedConversationId) err.conversationId = learnedConversationId;
@@ -913,7 +1136,7 @@ export function createClient(baseUrlOrOpts, maybeOpts) {
 
       let data;
       try {
-        data = parsePrintResult(stdout);
+        data = parsedData || parsePrintResult(stdout);
       } catch (err) {
         err.message += stderr.trim() ? ` [stderr: ${tailLines(stderr, 5).slice(0, 500)}]` : "";
         if (learnedConversationId && !err.conversationId) {
@@ -1030,6 +1253,12 @@ export async function connect(opts = {}) {
 // Test-only escape hatch (lets tests assert the timeout knob resolution).
 export const __test = {
   printTimeoutMs,
+  idleTimeoutMs,
+  maxIdleExtensions,
+  countChildren,
+  formatTimeoutDuration,
+  makeTimeoutError,
+  killWithEscalation,
   settingsDir,
   needsWindowsShell,
   waitForProcess,

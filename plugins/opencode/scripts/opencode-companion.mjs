@@ -1637,6 +1637,8 @@ async function handleConfig(argv) {
     ["AGY_MODEL",                 "(unset)", "Default agy model (per-call --model wins)"],
     ["AGY_EFFORT",                "(unset)", "Default agy reasoning effort: low|medium|high"],
     ["AGY_PRINT_TIMEOUT_MS",      "(OPENCODE_PROMPT_TIMEOUT_MS)", "agy --print absolute cap"],
+    ["AGY_IDLE_TIMEOUT_MS",       "(OPENCODE_IDLE_TIMEOUT_MS)", "agy idle watchdog (no stream activity → abort)"],
+    ["AGY_MAX_IDLE_EXTENSIONS",   "(OPENCODE_MAX_IDLE_EXTENSIONS)", "agy idle watchdog extensions when child running"],
     ["OPENCODE_REQUEST_TIMEOUT_MS", "1800000", "Per-HTTP-request abort timeout"],
     ["OPENCODE_PROMPT_TIMEOUT_MS",  "14400000", "sendPrompt absolute cap (race against server 5min body-close)"],
     ["OPENCODE_IDLE_TIMEOUT_MS",    "900000", "Session idle watchdog (no activity → abort)"],

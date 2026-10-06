@@ -167,6 +167,9 @@ comes back.
 |---|---|---|
 | `OPENCODE_BACKEND` | `opencode` | Active transport: `opencode` (default) or `agy` |
 | `AGY_MODEL` | (unset) | Default agy model override (per-call `--model` wins) |
+| `AGY_PRINT_TIMEOUT_MS` | (opencode prompt cap) | `agy --print` absolute cap / loose backstop (falls back to `OPENCODE_PROMPT_TIMEOUT_MS`, default 14400000) |
+| `AGY_IDLE_TIMEOUT_MS` | `600000` | agy idle watchdog — no stream activity for this long → abort (falls back to `OPENCODE_IDLE_TIMEOUT_MS`) |
+| `AGY_MAX_IDLE_EXTENSIONS` | `2` | agy idle watchdog extensions granted when descendant processes are alive (falls back to `OPENCODE_MAX_IDLE_EXTENSIONS`) |
 | `OPENCODE_REQUEST_TIMEOUT_MS` | `1800000` | Per-HTTP-request abort timeout |
 | `OPENCODE_PROMPT_TIMEOUT_MS` | `14400000` | `sendPrompt` absolute cap (races the 5-min server body-close) |
 | `OPENCODE_IDLE_TIMEOUT_MS` | `900000` | Session idle watchdog — no activity for this long → abort |

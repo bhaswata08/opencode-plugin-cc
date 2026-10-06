@@ -99,6 +99,19 @@ test("a bad result is not a transport failure", () => {
   }
 });
 
+test("agy timeout errors (idle and print timeout) are result failures, not transport failures", () => {
+  const idleErr = new Error("agy run killed after 10m with no stream activity (AGY_IDLE_TIMEOUT_MS=600000) [conversation conv-1]");
+  idleErr.agyStatus = "IDLE_TIMEOUT";
+  idleErr.conversationId = "conv-1";
+
+  const printErr = new Error("agy run hit the wall-clock cap of 30m (AGY_PRINT_TIMEOUT_MS=1800000) [conversation conv-2] [stderr: error: interrupted]");
+  printErr.agyStatus = "PRINT_TIMEOUT";
+  printErr.conversationId = "conv-2";
+
+  assert.equal(isTransportFailure(idleErr), false, "idle timeout must NOT trigger fallback");
+  assert.equal(isTransportFailure(printErr), false, "print timeout must NOT trigger fallback");
+});
+
 test("empty results count as a failed turn", () => {
   assert.equal(isEmptyResult(""), true);
   assert.equal(isEmptyResult("   \n "), true);

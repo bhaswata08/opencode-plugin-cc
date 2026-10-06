@@ -545,6 +545,51 @@ if has_flag "stream-json"; then
     echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"FAKE-TOOL-RESPONSE\\",\\"duration_seconds\\":0.1,\\"num_turns\\":1,\\"usage\\":{}}}"
     exit 0
   fi
+  if [[ "$PROMPT" == *"MAKE-IDLE-SILENT"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"starting\\"}}"
+    exec sleep 30
+  fi
+  if [[ "$PROMPT" == *"MAKE-CHILD-SLEEP"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    sleep 0.12 &
+    wait $!
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"done-child\\"}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"done-child\\",\\"duration_seconds\\":0.15,\\"num_turns\\":1,\\"usage\\":{}}}"
+    exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-TWO-SLOW-CHILDREN"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    for i in 1 2; do
+      sleep 0.25 &
+      wait $!
+      echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":$i,\\"state\\":\\"DONE\\",\\"step_type\\":\\"tool\\",\\"tool_name\\":\\"run_command\\"}}"
+    done
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"both-done\\",\\"duration_seconds\\":0.2,\\"num_turns\\":1,\\"usage\\":{}}}"
+    exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-STREAM-ACTIVE"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    for i in 1 2 3 4; do
+      sleep 0.03
+      echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":$i,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"chunk-$i\\"}}"
+    done
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"all-chunks-done\\",\\"duration_seconds\\":0.15,\\"num_turns\\":1,\\"usage\\":{}}}"
+    exit 0
+  fi
+  if [[ "$PROMPT" == *"MAKE-WALLCLOCK-STDOUT"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    echo "{\\"event\\":\\"step_update\\",\\"step_update\\":{\\"conversation_id\\":\\"$CID\\",\\"step_index\\":1,\\"state\\":\\"ACTIVE\\",\\"step_type\\":\\"agent_response\\",\\"text_delta\\":\\"some-output\\"}}"
+    echo "{\\"event\\":\\"result\\",\\"result\\":{\\"conversation_id\\":\\"$CID\\",\\"status\\":\\"SUCCESS\\",\\"response\\":\\"early-partial\\",\\"duration_seconds\\":0.05,\\"num_turns\\":1,\\"usage\\":{}}}"
+    exec sleep 30
+  fi
+  if [[ "$PROMPT" == *"MAKE-AGY-INTERRUPTED"* ]]; then
+    echo "{\\"event\\":\\"init\\",\\"conversation_id\\":\\"$CID\\",\\"init\\":{\\"cwd\\":\\"/workspace\\"}}"
+    sleep 0.08
+    >&2 echo "error: interrupted"
+    echo "{\"event\":\"result\",\"result\":{\"conversation_id\":\"$CID\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"interrupted\",\"duration_seconds\":0.08,\"num_turns\":1}}"
+    exit 0
+  fi
   if [[ "$PROMPT" == *"MAKE-SLEEP"* ]]; then
     if [[ -n "$AGY_FAKE_PIDFILE" ]]; then echo $$ > "$AGY_FAKE_PIDFILE"; fi
     # exec so SIGTERM lands directly on sleep (a trapped bash would wait it out).
@@ -617,6 +662,10 @@ describe("agy client against fake binary", () => {
       AGY_FAKE_PIDFILE: fakePidFile,
       AGY_PRINT_TIMEOUT_MS: undefined,
       OPENCODE_PROMPT_TIMEOUT_MS: undefined,
+      AGY_IDLE_TIMEOUT_MS: undefined,
+      AGY_MAX_IDLE_EXTENSIONS: undefined,
+      OPENCODE_IDLE_TIMEOUT_MS: undefined,
+      OPENCODE_MAX_IDLE_EXTENSIONS: undefined,
       AGY_MODEL: undefined,
       AGY_EFFORT: undefined,
     });
@@ -741,13 +790,88 @@ describe("agy client against fake binary", () => {
     assert.match(err.message, /permissions\.allow/);
   });
 
-  it("client-side timeout kills a hung child", async () => {
+  it("client-side timeout kills a hung child with PRINT_TIMEOUT", async () => {
     const client = createClient({ directory: "/tmp" });
     const err = await client.sendPrompt(null, "MAKE-SLEEP please", { timeoutMs: 400 }).then(
       () => { throw new Error("should have thrown"); },
       (e) => e,
     );
-    assert.match(err.message, /no output|UNKNOWN/);
+    assert.equal(err.agyStatus, "PRINT_TIMEOUT");
+    assert.match(err.message, /AGY_PRINT_TIMEOUT_MS=400/);
+    assert.match(err.message, /wall-clock cap/);
+  });
+
+  it("(a) idle watchdog kills process that goes silent with no children (IDLE_TIMEOUT)", async () => {
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "60" });
+    const client = createClient({ directory: "/tmp" });
+    const err = await client.sendPrompt(null, "MAKE-IDLE-SILENT", { timeoutMs: 10_000 }).then(
+      () => { throw new Error("should have thrown"); },
+      (e) => e,
+    );
+    assert.equal(err.agyStatus, "IDLE_TIMEOUT");
+    assert.match(err.message, /AGY_IDLE_TIMEOUT_MS=60/);
+    assert.match(err.message, /with no stream activity/);
+    assert.equal(err.conversationId, "fresh-conv-123");
+  });
+
+  it("(b) idle watchdog grants extension when child process is alive and succeeds on resumed output", async () => {
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "60", AGY_MAX_IDLE_EXTENSIONS: "2" });
+    const progressLines = [];
+    const client = createClient({ directory: "/tmp" });
+    const res = await client.sendPrompt(null, "MAKE-CHILD-SLEEP", {
+      timeoutMs: 10_000,
+      onProgress: (line) => progressLines.push(line),
+    });
+    assert.equal(res.agy.status, "SUCCESS");
+    assert.equal(res.parts[0].text, "done-child");
+    assert.ok(
+      progressLines.some((l) => l.includes("extension 1/2") || l.includes("idle extension")),
+      `expected idle extension in progress lines, got: ${JSON.stringify(progressLines)}`,
+    );
+  });
+
+  it("(b2) idle extensions reset on stream activity, so each slow command gets the allowance", async () => {
+    // Each 250ms child outlasts the 150ms window once. With one extension per
+    // run instead of per quiet stretch, the second child would be killed.
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "150", AGY_MAX_IDLE_EXTENSIONS: "1" });
+    const client = createClient({ directory: "/tmp" });
+    const res = await client.sendPrompt(null, "MAKE-TWO-SLOW-CHILDREN", { timeoutMs: 10_000 });
+    assert.equal(res.agy.status, "SUCCESS");
+    assert.equal(res.parts[0].text, "both-done");
+  });
+
+  it("(c) process that keeps emitting events past the idle window is not killed", async () => {
+    // 50ms idle window, 0 extensions allowed. Emits chunks every 30ms over 120ms (> 50ms).
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "50", AGY_MAX_IDLE_EXTENSIONS: "0" });
+    const client = createClient({ directory: "/tmp" });
+    const res = await client.sendPrompt(null, "MAKE-STREAM-ACTIVE", { timeoutMs: 10_000 });
+    assert.equal(res.agy.status, "SUCCESS");
+    assert.equal(res.parts[0].text, "all-chunks-done");
+  });
+
+  it("(d) wall-clock kill with stdout present yields PRINT_TIMEOUT naming AGY_PRINT_TIMEOUT_MS", async () => {
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "0", AGY_PRINT_TIMEOUT_MS: "80" });
+    const client = createClient({ directory: "/tmp" });
+    const err = await client.sendPrompt(null, "MAKE-WALLCLOCK-STDOUT", { timeoutMs: 80 }).then(
+      () => { throw new Error("should have thrown"); },
+      (e) => e,
+    );
+    assert.equal(err.agyStatus, "PRINT_TIMEOUT");
+    assert.match(err.message, /AGY_PRINT_TIMEOUT_MS=80/);
+    assert.match(err.message, /wall-clock cap/);
+    assert.equal(err.conversationId, "fresh-conv-123");
+  });
+
+  it("(e) agy own --print-timeout firing produces PRINT_TIMEOUT when ending near wall-clock deadline", async () => {
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "0", AGY_PRINT_TIMEOUT_MS: "100" });
+    const client = createClient({ directory: "/tmp" });
+    const err = await client.sendPrompt(null, "MAKE-AGY-INTERRUPTED", { timeoutMs: 100 }).then(
+      () => { throw new Error("should have thrown"); },
+      (e) => e,
+    );
+    assert.equal(err.agyStatus, "PRINT_TIMEOUT");
+    assert.match(err.message, /AGY_PRINT_TIMEOUT_MS=100/);
+    assert.match(err.message, /wall-clock cap/);
   });
 
   it("abortSession kills an in-flight prompt", async () => {
@@ -841,6 +965,42 @@ describe("agy client against fake binary", () => {
     setEnv({ AGY_PRINT_TIMEOUT_MS: "12345" });
     assert.equal(__test.printTimeoutMs(), 12345);
     assert.ok(__test.settingsDir().endsWith(path.join(".gemini", "antigravity-cli")));
+  });
+
+  it("__test exposes the resolved idle timeout and extension cap", () => {
+    // Default
+    setEnv({ AGY_IDLE_TIMEOUT_MS: undefined, OPENCODE_IDLE_TIMEOUT_MS: undefined });
+    assert.equal(__test.idleTimeoutMs(), 600_000);
+
+    // AGY_IDLE_TIMEOUT_MS
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "12345", OPENCODE_IDLE_TIMEOUT_MS: "999" });
+    assert.equal(__test.idleTimeoutMs(), 12345);
+
+    // Fallback to OPENCODE_IDLE_TIMEOUT_MS
+    setEnv({ AGY_IDLE_TIMEOUT_MS: undefined, OPENCODE_IDLE_TIMEOUT_MS: "54321" });
+    assert.equal(__test.idleTimeoutMs(), 54321);
+
+    // Disabled with 0 or non-finite
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "0" });
+    assert.equal(__test.idleTimeoutMs(), 0);
+    setEnv({ AGY_IDLE_TIMEOUT_MS: "not-a-number" });
+    assert.equal(__test.idleTimeoutMs(), 0);
+
+    // Default max idle extensions
+    setEnv({ AGY_MAX_IDLE_EXTENSIONS: undefined, OPENCODE_MAX_IDLE_EXTENSIONS: undefined });
+    assert.equal(__test.maxIdleExtensions(), 2);
+
+    // AGY_MAX_IDLE_EXTENSIONS
+    setEnv({ AGY_MAX_IDLE_EXTENSIONS: "5", OPENCODE_MAX_IDLE_EXTENSIONS: "1" });
+    assert.equal(__test.maxIdleExtensions(), 5);
+
+    // Fallback to OPENCODE_MAX_IDLE_EXTENSIONS
+    setEnv({ AGY_MAX_IDLE_EXTENSIONS: undefined, OPENCODE_MAX_IDLE_EXTENSIONS: "4" });
+    assert.equal(__test.maxIdleExtensions(), 4);
+
+    // 0 disables extensions
+    setEnv({ AGY_MAX_IDLE_EXTENSIONS: "0" });
+    assert.equal(__test.maxIdleExtensions(), 0);
   });
 
   it("__test.needsWindowsShell: only true on win32 for .cmd/.bat/.ps1 binaries", () => {
