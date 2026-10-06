@@ -3,9 +3,11 @@
 // OpenCode exposes a REST API + SSE. This module wraps that API.
 
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { stateRoot } from "./state.mjs";
 
 // Re-export for spec-compliance / discoverability: probeSessionTerminal lives
 // in auto-heal.mjs because it is tightly coupled to heal-decision logic, but
@@ -265,6 +267,22 @@ export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT) 
 }
 
 /**
+ * Open the append-mode log that a spawned `opencode serve` writes to.
+ * Returns null when it cannot be opened; the server then runs without one.
+ * @param {string} [cwd]
+ * @returns {number|null}
+ */
+function openServeLog(cwd) {
+  try {
+    const base = path.dirname(stateRoot(cwd ?? process.cwd()));
+    fs.mkdirSync(base, { recursive: true });
+    return fs.openSync(path.join(base, "opencode-serve.log"), "a");
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Start the OpenCode server if not already running.
  * @param {object} opts
  * @param {string} [opts.host]
@@ -290,13 +308,25 @@ export async function ensureServer(opts = {}) {
   }
 
   // Start the server
-  // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
-  const proc = spawn("opencode", ["serve", "--port", String(port)], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true,
-    cwd: opts.cwd,
-    shell: IS_WINDOWS,
-  });
+  // Its output goes to a file, never a pipe. proc.unref() does not release
+  // stdio pipe handles, so with pipes the spawning process (often a task
+  // worker) could never exit, and the undrained pipe could eventually block
+  // the server's own writes. The server is shared by every workspace, so the
+  // log sits in the shared state base, not under one workspace.
+  const logFd = openServeLog(opts.cwd);
+  let proc;
+  try {
+    // Windows npm shims are .cmd/.ps1; spawn() only resolves those via a shell.
+    proc = spawn("opencode", ["serve", "--port", String(port)], {
+      stdio: ["ignore", logFd ?? "ignore", logFd ?? "ignore"],
+      detached: true,
+      cwd: opts.cwd,
+      shell: IS_WINDOWS,
+    });
+  } finally {
+    // The child has its own copy now.
+    if (logFd !== null) fs.closeSync(logFd);
+  }
   proc.unref();
 
   // Wait for the server to become ready
