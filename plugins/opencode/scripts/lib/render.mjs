@@ -71,6 +71,11 @@ export function renderResult(job, resultData) {
 
   if (job.status === "failed") {
     lines.push(`### Error\n\n${job.errorMessage ?? "Unknown error"}`);
+    // The agent can finish and the job still fail afterwards (worker killed
+    // during the review loop). Its answer was saved before the loop ran.
+    if (job.agentOutput) {
+      lines.push(`\n### Agent output (saved before the failure)\n\n${job.agentOutput}`);
+    }
   } else if (resultData) {
     if (resultData.rendered) {
       lines.push(`### Output\n\n${resultData.rendered}`);

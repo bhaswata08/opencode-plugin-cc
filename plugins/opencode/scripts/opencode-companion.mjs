@@ -17,7 +17,7 @@ import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob,
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, renderClear } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt, buildFixPrompt, buildVerifyPrompt, buildTreeContext } from "./lib/prompts.mjs";
-import { getDiff, getStatus as getGitStatus, getDiffStat, getChangedFiles, getUntrackedFiles, parseShortstat } from "./lib/git.mjs";
+import { getDiff, getStatus as getGitStatus, parseShortstat, snapshotWorktree, diffTrees, TASK_DIFF_EXCLUDES } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
 import { autoHealJob, autoHealJobs, getSessionLastActivity } from "./lib/auto-heal.mjs";
 import { ensureOpencodeConfig, readOpencodeConfig, missingPermissions, resolveConfigPath } from "./lib/opencode-config.mjs";
@@ -368,14 +368,26 @@ async function maybeRunReviewLoop({
   coderSessionId,
   coderModel,
   coderBackend,
+  baselineTree,
   report,
   log,
 }) {
-  // Read the size from git, never from the coder own account of what it did.
-  const stat = parseShortstat(await getDiffStat(workspace));
-  const tracked = await getChangedFiles(workspace);
-  const untracked = await getUntrackedFiles(workspace);
-  const changedFiles = [...new Set([...tracked, ...untracked])];
+  if (!isWrite) return null;
+  // Without a baseline the only diff available is against HEAD, which
+  // counts every uncommitted change already in the tree as the task's.
+  // Reviewing someone else's work is worse than not reviewing at all.
+  if (!baselineTree) {
+    log("Review loop skipped: no pre-task snapshot of the working tree (not a git repo, or the snapshot failed).");
+    return null;
+  }
+
+  // Read the size from git, never from the coder own account of what it
+  // did, and only what changed since the task started.
+  const headTree = (await snapshotWorktree(workspace)) ?? baselineTree;
+  const stat = parseShortstat(await diffTrees(workspace, baselineTree, headTree, "shortstat", { exclude: TASK_DIFF_EXCLUDES }));
+  const changedFiles = (await diffTrees(workspace, baselineTree, headTree, "name-only", { exclude: TASK_DIFF_EXCLUDES }))
+    .split("\n")
+    .filter(Boolean);
 
   const decision = shouldRunLoop({
     isWrite,
@@ -401,8 +413,8 @@ async function maybeRunReviewLoop({
 
     const prompt =
       round === 1
-        ? await buildReviewPrompt(workspace, { adversarial: false }, PLUGIN_ROOT)
-        : buildVerifyPrompt(previousFindings, await buildTreeContext(workspace));
+        ? await buildReviewPrompt(workspace, { adversarial: false, baseTree: baselineTree }, PLUGIN_ROOT)
+        : buildVerifyPrompt(previousFindings, await buildTreeContext(workspace, { baseTree: baselineTree }));
 
     let reviewClient;
     let reviewSessionId;
@@ -561,7 +573,10 @@ async function handleTask(argv) {
   }
 
   const workspace = await resolveWorkspace();
-  const isWrite = options.write !== undefined ? options.write : true;
+  // Read-only unless asked. Upstream defaulted to write, which turned a
+  // question ("what version is in package.json?") into a build-agent run
+  // with the review loop armed.
+  const isWrite = options.write === true;
   const agentName = options.agent ?? (isWrite ? "build" : "plan");
 
   // A seat can pin its own default transport (coder -> agy). An explicit
@@ -664,6 +679,7 @@ async function handleTask(argv) {
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
+      const baselineTree = isWrite ? await snapshotWorktree(workspace) : null;
 
       report("investigating", "Sending task to OpenCode...");
       log(`Agent: ${agentName}, Backend: ${initialBackend}, Write: ${isWrite}, Prompt: ${prompt.length} chars`);
@@ -722,6 +738,10 @@ async function handleTask(argv) {
       report("finalizing", "Processing task output...");
 
       const text = value.text;
+      // Persist the answer before the review loop: the loop can run for
+      // minutes, and a worker killed inside it must not take the answer
+      // with it. auto-heal and `result` surface it on a failed job.
+      upsertJob(workspace, { id: job.id, agentOutput: text });
 
       const loopResult = await maybeRunReviewLoop({
         workspace,
@@ -734,6 +754,7 @@ async function handleTask(argv) {
         coderSessionId: activeSessionId,
         coderModel: initialModel,
         coderBackend: initialBackend,
+        baselineTree,
         report,
         log,
       });
@@ -801,6 +822,7 @@ async function handleTaskWorker(argv) {
   try {
     await runTrackedJob(workspace, { id: jobId, backend: initialBackend }, async ({ report, log }) => {
       const prompt = buildTaskPrompt(taskText, { write: isWrite });
+      const baselineTree = isWrite ? await snapshotWorktree(workspace) : null;
       report("investigating", "Running task...");
 
       let activeClient;
@@ -858,6 +880,8 @@ async function handleTaskWorker(argv) {
 
       const text = value;
       if (usedFallback) upsertJob(workspace, { id: jobId, usedFallback: true });
+      // See the foreground path: keep the answer if the loop dies.
+      upsertJob(workspace, { id: jobId, agentOutput: text });
 
       const loopResult = await maybeRunReviewLoop({
         workspace,
@@ -870,6 +894,7 @@ async function handleTaskWorker(argv) {
         coderSessionId: activeSessionId,
         coderModel: options.model,
         coderBackend: initialBackend,
+        baselineTree,
         report,
         log,
       });

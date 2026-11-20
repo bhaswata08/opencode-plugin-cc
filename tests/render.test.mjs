@@ -78,6 +78,21 @@ describe("renderResult", () => {
       null
     );
     assert.ok(output.includes("Connection timeout"));
+    assert.ok(!output.includes("Agent output"));
+  });
+
+  it("shows the saved agent answer on a job that failed after answering", () => {
+    const output = renderResult(
+      {
+        id: "task-3", type: "task", status: "failed", elapsed: "6m",
+        errorMessage: "task-worker exited without result",
+        agentOutput: "version is 2.4.1",
+      },
+      null
+    );
+    assert.ok(output.includes("task-worker exited without result"));
+    assert.ok(output.includes("Agent output (saved before the failure)"));
+    assert.ok(output.includes("version is 2.4.1"));
   });
 });
 

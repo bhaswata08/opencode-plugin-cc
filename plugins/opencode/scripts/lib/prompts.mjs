@@ -2,28 +2,53 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { getDiff, getStatus, getChangedFiles } from "./git.mjs";
+import { getDiff, getStatus, getChangedFiles, snapshotWorktree, diffTrees, TASK_DIFF_EXCLUDES } from "./git.mjs";
+
+/**
+ * Diff, status and changed files for a review. With opts.baseTree, only what
+ * changed since that snapshot (see snapshotWorktree); otherwise the working
+ * tree against HEAD, or the branch against opts.base.
+ */
+async function collectChanges(cwd, opts = {}) {
+  if (opts.baseTree) {
+    const head = (await snapshotWorktree(cwd)) ?? opts.baseTree;
+    return {
+      diff: await diffTrees(cwd, opts.baseTree, head, "patch", { exclude: TASK_DIFF_EXCLUDES }),
+      status: await diffTrees(cwd, opts.baseTree, head, "name-status", { exclude: TASK_DIFF_EXCLUDES }),
+      changedFiles: (await diffTrees(cwd, opts.baseTree, head, "name-only", { exclude: TASK_DIFF_EXCLUDES })).split("\n").filter(Boolean),
+    };
+  }
+  return {
+    diff: await getDiff(cwd, { base: opts.base }),
+    status: await getStatus(cwd),
+    changedFiles: await getChangedFiles(cwd, { base: opts.base }),
+  };
+}
+
+function targetLabelFor(opts) {
+  if (opts.baseTree) return "changes made by this task (uncommitted work that predates the task is excluded)";
+  return opts.base ? `branch diff against ${opts.base}` : "working tree changes";
+}
 
 /**
  * Build the review prompt for OpenCode.
  * @param {string} cwd
  * @param {object} opts
  * @param {string} [opts.base] - base branch/ref for comparison
+ * @param {string} [opts.baseTree] - snapshotWorktree() tree; review only what changed since it
  * @param {boolean} [opts.adversarial] - use adversarial review prompt
  * @param {string} [opts.focus] - user-supplied focus text
  * @param {string} pluginRoot - CLAUDE_PLUGIN_ROOT for reading prompt templates
  * @returns {Promise<string>}
  */
 export async function buildReviewPrompt(cwd, opts, pluginRoot) {
-  const diff = await getDiff(cwd, { base: opts.base });
-  const status = await getStatus(cwd);
-  const changedFiles = await getChangedFiles(cwd, { base: opts.base });
+  const { diff, status, changedFiles } = await collectChanges(cwd, opts);
 
   let systemPrompt;
   if (opts.adversarial) {
     const templatePath = path.join(pluginRoot, "prompts", "adversarial-review.md");
     systemPrompt = fs.readFileSync(templatePath, "utf8")
-      .replace("{{TARGET_LABEL}}", opts.base ? `Branch diff against ${opts.base}` : "Working tree changes")
+      .replace("{{TARGET_LABEL}}", targetLabelFor(opts))
       .replace("{{USER_FOCUS}}", opts.focus || "General review")
       .replace("{{REVIEW_INPUT}}", buildReviewContext(diff, status, changedFiles));
   } else {
@@ -37,7 +62,7 @@ export async function buildReviewPrompt(cwd, opts, pluginRoot) {
  * Build a standard (non-adversarial) review prompt.
  */
 function buildStandardReviewPrompt(diff, status, changedFiles, opts) {
-  const targetLabel = opts.base ? `branch diff against ${opts.base}` : "working tree changes";
+  const targetLabel = targetLabelFor(opts);
 
   return `You are performing a code review of ${targetLabel}.
 
@@ -85,13 +110,11 @@ function buildReviewContext(diff, status, changedFiles) {
  * is.
  *
  * @param {string} cwd
- * @param {{base?: string}} [opts]
+ * @param {{base?: string, baseTree?: string}} [opts]
  * @returns {Promise<string>}
  */
 export async function buildTreeContext(cwd, opts = {}) {
-  const diff = await getDiff(cwd, { base: opts.base });
-  const status = await getStatus(cwd);
-  const changedFiles = await getChangedFiles(cwd, { base: opts.base });
+  const { diff, status, changedFiles } = await collectChanges(cwd, opts);
   return buildReviewContext(diff, status, changedFiles);
 }
 

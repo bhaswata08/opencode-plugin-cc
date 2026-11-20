@@ -325,7 +325,10 @@ export async function autoHealJob(workspace, job, opts = {}) {
   }
 
   const idleSec = Number.isFinite(idleMs) ? Math.floor(idleMs / 1000) : -1;
-  const errMsg = `task-worker exited without completion; session last updated ${idleSec}s ago`;
+  const errMsg = withSavedOutputNote(
+    `task-worker exited without completion; session last updated ${idleSec}s ago`,
+    job,
+  );
 
   if (dryRun) {
     return { job, action: "would-fail", details: { errorMessage: errMsg } };
@@ -343,6 +346,17 @@ export async function autoHealJob(workspace, job, opts = {}) {
     action: "healed-failed",
     details: { errorMessage: errMsg },
   };
+}
+
+/**
+ * A worker that dies after the agent answered (typically inside the review
+ * loop) saved that answer as job.agentOutput first. Say so in the error, so
+ * nobody reruns a task whose answer is already on record.
+ */
+export function withSavedOutputNote(errMsg, job) {
+  if (!job?.agentOutput) return errMsg;
+  const where = job.phase === "reviewing" || job.phase === "editing" ? " during the review loop" : "";
+  return `${errMsg}. The worker died${where} after the agent had answered; the answer was saved and \`result\` shows it.`;
 }
 
 /**
@@ -365,7 +379,10 @@ export async function autoHealAgyJob(workspace, job, opts = {}) {
   if (idleMs < STALE_IDLE_MS) {
     return { job, action: "skip", reason: `idle ${Math.floor(idleMs / 1000)}s < ${STALE_IDLE_MS / 1000}s threshold` };
   }
-  const errMsg = "task-worker exited without result (agy backend: no server session to reconcile)";
+  const errMsg = withSavedOutputNote(
+    "task-worker exited without result (agy backend: no server session to reconcile)",
+    job,
+  );
   if (dryRun) {
     return { job, action: "would-fail", details: { errorMessage: errMsg } };
   }

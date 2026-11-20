@@ -1,5 +1,8 @@
 // Git utilities for the OpenCode companion.
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { runCommand } from "./process.mjs";
 
 /**
@@ -125,4 +128,75 @@ export function parseShortstat(stat) {
   const inserted = Number(text.match(/(\d+)\s+insertions?\(\+\)/)?.[1] ?? 0);
   const deleted = Number(text.match(/(\d+)\s+deletions?\(-\)/)?.[1] ?? 0);
   return { files, lines: inserted + deleted };
+}
+
+/**
+ * Record the whole working tree, tracked edits and untracked files alike, as
+ * a git tree object, without touching the real index or HEAD.
+ *
+ * A write task must be judged by what IT changed, and a plain `git diff`
+ * against HEAD cannot tell that apart from uncommitted work already in the
+ * tree (another session's edits, a half-finished refactor). Snapshot before
+ * the task, snapshot after, diff the two trees.
+ *
+ * Uses a throwaway index seeded from the real one, so unchanged files reuse
+ * its stat cache and are not rehashed. Ignored files stay out, as with
+ * `git add`. The tree objects land in the object store unreferenced and are
+ * collected by a later `git gc`.
+ *
+ * @param {string} cwd
+ * @returns {Promise<string|null>} tree sha, or null when cwd is not a git
+ *   work tree or the snapshot failed
+ */
+export async function snapshotWorktree(cwd) {
+  const idx = await runCommand("git", ["rev-parse", "--path-format=absolute", "--git-path", "index"], { cwd });
+  if (idx.exitCode !== 0) return null;
+  const tmpIndex = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), "oc-snapshot-")),
+    "index",
+  );
+  try {
+    try {
+      fs.copyFileSync(idx.stdout.trim(), tmpIndex);
+    } catch {
+      // No index yet (fresh repo): start from an empty one.
+    }
+    const env = { GIT_INDEX_FILE: tmpIndex };
+    const add = await runCommand("git", ["add", "--all", "--", ":/"], { cwd, env });
+    if (add.exitCode !== 0) return null;
+    const tree = await runCommand("git", ["write-tree"], { cwd, env });
+    if (tree.exitCode !== 0) return null;
+    return tree.stdout.trim() || null;
+  } finally {
+    fs.rmSync(path.dirname(tmpIndex), { recursive: true, force: true });
+  }
+}
+
+/**
+ * Files the transport itself writes into the workspace during a task. They
+ * are plumbing, not the agent's work: the agy runner creates .geminiignore
+ * before every prompt (see ensureGeminiIgnore), and counting it would push a
+ * one-file change past the review loop's floor. The cost is that a task that
+ * deliberately edits .geminiignore is not reviewed for it.
+ */
+export const TASK_DIFF_EXCLUDES = [".geminiignore"];
+
+/**
+ * Diff between two snapshot trees.
+ * @param {string} cwd
+ * @param {string} baseTree
+ * @param {string} headTree
+ * @param {"patch"|"shortstat"|"name-only"|"name-status"} [mode]
+ * @param {{exclude?: string[]}} [opts] - repo-root-relative paths to leave out
+ * @returns {Promise<string>}
+ */
+export async function diffTrees(cwd, baseTree, headTree, mode = "patch", { exclude = [] } = {}) {
+  const args = ["diff"];
+  if (mode !== "patch") args.push(`--${mode}`);
+  args.push(baseTree, headTree);
+  if (exclude.length) {
+    args.push("--", ":/", ...exclude.map((p) => `:(top,exclude)${p}`));
+  }
+  const { stdout } = await runCommand("git", args, { cwd });
+  return mode === "patch" ? stdout : stdout.trim();
 }

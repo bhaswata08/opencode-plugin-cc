@@ -485,7 +485,25 @@ describe("autoHealAgyJob", () => {
     const r = await autoHealAgyJob(workspace, job);
     assert.equal(r.action, "healed-failed");
     assert.match(r.details.errorMessage, /agy backend/);
+    assert.doesNotMatch(r.details.errorMessage, /answer was saved/);
     assert.equal(loadState(workspace).jobs[0].status, "failed");
+  });
+
+  it("says the answer was kept when the worker died in the review loop", async () => {
+    const job = {
+      id: "dead-loop",
+      backend: "agy",
+      status: "running",
+      phase: "reviewing",
+      agentOutput: "version is 2.4.1",
+      pid: 2_000_000_001,
+      updatedAt: new Date(Date.now() - 600_000).toISOString(),
+    };
+    upsertJob(workspace, { ...job });
+    const r = await autoHealAgyJob(workspace, job);
+    assert.equal(r.action, "healed-failed");
+    assert.match(r.details.errorMessage, /during the review loop.*answer was saved/);
+    assert.equal(loadState(workspace).jobs[0].agentOutput, "version is 2.4.1");
   });
 
   it("dry-run reports without writing", async () => {

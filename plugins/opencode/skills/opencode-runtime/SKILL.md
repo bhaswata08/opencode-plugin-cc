@@ -64,6 +64,10 @@ Flag handling (since 1.10.0-agy):
   and pass `--task-file <path>`. The companion reads it as UTF-8 and treats it
   exactly as typed text. It cannot be combined with positional prompt text, and it
   errors on a missing, unreadable or empty file.
+- `task` is read-only unless you pass `--write`: without it the job runs the
+  `plan` agent and the review loop never starts. A write job snapshots the
+  working tree when it starts, and its review loop sees only what changed after
+  that, so uncommitted work already in the repo is not counted as the job's.
 
 Safety rules:
 
