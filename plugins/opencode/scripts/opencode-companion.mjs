@@ -1603,10 +1603,10 @@ async function doctorAgyChecks(push) {
   }
 
   if (cap.authPresent) {
-    push("agy-auth", "PASS", "auth token present", null);
+    push("agy-auth", "PASS", "logged in", null);
   } else {
     push("agy-auth", "FAIL",
-      cap.problems.find((p) => /auth token/.test(p)) ?? "no auth token",
+      cap.problems.find((p) => /not logged in/.test(p)) ?? "agy is not logged in",
       "Run agy interactively once to authenticate");
   }
 

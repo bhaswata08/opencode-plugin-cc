@@ -552,6 +552,48 @@ function authTokenPresent() {
   }
 }
 
+/**
+ * Parse `agy models` output into model ids. Each model line is
+ * "<id>\t<display name>"; status lines such as "Fetching available
+ * models..." have no tab and are skipped.
+ * @param {string} stdout
+ * @returns {string[]}
+ */
+export function parseModelList(stdout) {
+  return String(stdout || "")
+    .split("\n")
+    .map((l) => l.match(/^(\S+)\t/))
+    .filter(Boolean)
+    .map((m) => m[1]);
+}
+
+// A positive keyring probe holds for the life of the process, so repeated
+// getCapability() calls (isServerRunning, then ensureServer) pay the ~4s
+// `agy models` round trip once. Failures are not cached: the user may log
+// in between calls.
+let keyringAuthConfirmed = false;
+
+/**
+ * agy 1.5.x keeps its login in the system keyring and writes no token file,
+ * so a missing file does not mean "logged out". Ask agy itself: `agy models`
+ * lists models only with a valid login and spends no generation quota.
+ * @returns {Promise<boolean>}
+ */
+async function keyringAuthPresent() {
+  if (keyringAuthConfirmed) return true;
+  const r = await runBinary(["models"], { timeoutMs: 30_000 });
+  if (r.exitCode === 0 && parseModelList(r.stdout).length > 0) {
+    keyringAuthConfirmed = true;
+    return true;
+  }
+  return false;
+}
+
+/** Test hook: forget a cached keyring probe result. */
+export function _resetAuthProbeCache() {
+  keyringAuthConfirmed = false;
+}
+
 export const EXIT_DRAIN_GRACE_MS = 500;
 
 /**
@@ -749,8 +791,9 @@ export function runBinary(args, { timeoutMs = 15_000 } = {}) {
 }
 
 /**
- * Check the agy backend is usable: binary present, version resolvable, auth
- * token exists. Never throws - returns a capability object.
+ * Check the agy backend is usable: binary present, version resolvable, and
+ * logged in (token file, or a keyring login that `agy models` confirms).
+ * Never throws - returns a capability object.
  * @returns {Promise<{ ok: boolean, binary: string, version: string|null, authPresent: boolean, problems: string[] }>}
  */
 export async function getCapability() {
@@ -763,10 +806,12 @@ export async function getCapability() {
       `agy binary not usable ("${bin} --version" failed${r.stderr.trim() ? `: ${r.stderr.trim().slice(0, 200)}` : ""}). Install agy and ensure it is on PATH.`,
     );
   }
-  const authPresent = authTokenPresent();
-  if (!authPresent) {
+  // Probe the keyring only when the binary works; otherwise the binary
+  // problem above is the one to report.
+  const authPresent = authTokenPresent() || (version !== null && (await keyringAuthPresent()));
+  if (!authPresent && version !== null) {
     problems.push(
-      `no agy auth token at ${path.join(settingsDir(), "antigravity-oauth-token")}. Run agy interactively once to authenticate.`,
+      `agy is not logged in: no auth token file at ${path.join(settingsDir(), "antigravity-oauth-token")}, and "${bin} models" listed no models. Run agy interactively once to authenticate.`,
     );
   }
   return { ok: problems.length === 0, binary: bin, version, authPresent, problems };

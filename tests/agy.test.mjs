@@ -27,6 +27,8 @@ import {
   AGY_ALLOWLIST_DOC,
   createClient,
   getCapability,
+  parseModelList,
+  _resetAuthProbeCache,
   isServerRunning,
   ensureServer,
   connect,
@@ -510,7 +512,11 @@ echo "$@" >> "$AGY_FAKE_LOG"
 ALL_ARGS=" $* "
 has_flag() { [[ "$ALL_ARGS" == *" $1 "* ]]; }
 if has_flag "--version"; then echo "9.9.9-test"; exit 0; fi
-if [[ "$1" == "models" ]]; then printf 'model-a\\tModel A\\nmodel-b\\tModel B\\n'; exit 0; fi
+if [[ "$1" == "models" ]]; then
+  if [[ "$AGY_FAKE_MODELS" == "fail" ]]; then echo "not logged in" >&2; exit 1; fi
+  if [[ "$AGY_FAKE_MODELS" == "empty" ]]; then echo "Fetching available models..."; exit 0; fi
+  printf 'Fetching available models...\\nmodel-a\\tModel A\\nmodel-b\\tModel B\\n'; exit 0
+fi
 CONV=""; PROMPT=""; PREV=""
 for a in "$@"; do
   if [[ "$PREV" == "--conversation" ]]; then CONV="$a"; fi
@@ -668,7 +674,9 @@ describe("agy client against fake binary", () => {
       OPENCODE_MAX_IDLE_EXTENSIONS: undefined,
       AGY_MODEL: undefined,
       AGY_EFFORT: undefined,
+      AGY_FAKE_MODELS: undefined,
     });
+    _resetAuthProbeCache();
   });
 
   afterEach(() => {
@@ -676,6 +684,8 @@ describe("agy client against fake binary", () => {
   });
 
   const loggedArgs = () => fs.readFileSync(fakeLog, "utf8");
+  const removeToken = () =>
+    fs.rmSync(path.join(fakeHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
 
   it("capability check passes with fake binary + token", async () => {
     const cap = await getCapability();
@@ -685,13 +695,46 @@ describe("agy client against fake binary", () => {
     assert.equal(await isServerRunning(), true);
   });
 
-  it("capability fails without a token", async () => {
-    fs.rmSync(path.join(fakeHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+  it("capability with a token file does not probe agy models", async () => {
+    await getCapability();
+    assert.doesNotMatch(loggedArgs(), /^models/m);
+  });
+
+  it("capability passes on keyring login when the token file is missing", async () => {
+    // agy 1.5.x stores its login in the system keyring, not a file.
+    removeToken();
+    const cap = await getCapability();
+    assert.equal(cap.ok, true);
+    assert.equal(cap.authPresent, true);
+    assert.equal(await isServerRunning(), true);
+    // The positive probe is cached: one `agy models` call for both checks.
+    assert.equal(loggedArgs().match(/^models/gm).length, 1);
+  });
+
+  it("capability fails without a token when agy models fails", async () => {
+    removeToken();
+    setEnv({ AGY_FAKE_MODELS: "fail" });
     const cap = await getCapability();
     assert.equal(cap.ok, false);
     assert.equal(cap.authPresent, false);
     assert.equal(await isServerRunning(), false);
-    await assert.rejects(() => ensureServer(), /auth token/);
+    await assert.rejects(() => ensureServer(), /not logged in/);
+  });
+
+  it("capability fails without a token when agy models lists nothing", async () => {
+    removeToken();
+    setEnv({ AGY_FAKE_MODELS: "empty" });
+    const cap = await getCapability();
+    assert.equal(cap.ok, false);
+    assert.equal(cap.authPresent, false);
+  });
+
+  it("parseModelList keeps only tab-separated model lines", () => {
+    assert.deepEqual(
+      parseModelList("Fetching available models...\nmodel-a\tModel A\n\nmodel-b\tModel B\n"),
+      ["model-a", "model-b"],
+    );
+    assert.deepEqual(parseModelList(""), []);
   });
 
   it("ensureServer/connect return the cli pseudo-url", async () => {
